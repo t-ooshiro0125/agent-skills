@@ -1,0 +1,3 @@
+interface:
+  display_name: "Review Refactor"
+  short_description: "挙動を変えずに可読性・保守性・変更容易性を改善する候補だけを提示"

@@ -1,0 +1,3 @@
+interface:
+  display_name: "Worktree From Issue"
+  short_description: "Issue を起点に worktree の作成・再利用と必要なローカルファイル共有を統括"

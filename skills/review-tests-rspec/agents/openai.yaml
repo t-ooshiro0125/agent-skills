@@ -1,0 +1,3 @@
+interface:
+  display_name: "Review Tests RSpec"
+  short_description: "共通基準に RSpec 固有の構成・評価順序・検証の観点を加えてレビュー"

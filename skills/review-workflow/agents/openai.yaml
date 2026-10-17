@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Workflow"
+  short_description: "差分レビュー・反証・リファクタ候補の確認を順に実行し、最後にユーザーの判断が必要な事項だけを挙げる"
+  default_prompt: "$review-workflow を使って、現在の差分のレビューから反証、リファクタ候補の確認までを通しで実行してください。"

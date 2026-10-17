@@ -1,0 +1,3 @@
+interface:
+  display_name: "Review Handoff"
+  short_description: "ユーザーの判断を優先し、未確定の任意改善は実装価値で選別して、採用したレビュー対応だけを開発者向け指示にまとめる"

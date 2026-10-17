@@ -1,0 +1,3 @@
+interface:
+  display_name: 'Implementation Challenge'
+  short_description: '実装前にレビュー結果を再検証し、不足する前提・破綻条件・確認すべき一次情報を指摘'

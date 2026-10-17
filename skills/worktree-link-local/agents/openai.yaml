@@ -1,0 +1,3 @@
+interface:
+  display_name: "Worktree Link Local"
+  short_description: "既存 worktree 間で必要な Git 除外対象のローカルファイルを共有"

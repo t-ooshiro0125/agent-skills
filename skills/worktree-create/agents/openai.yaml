@@ -1,0 +1,3 @@
+interface:
+  display_name: "Worktree Create"
+  short_description: "元の作業状態を保護し、Git worktree の作成・再利用を行う"

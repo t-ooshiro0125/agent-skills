@@ -1,0 +1,3 @@
+interface:
+  display_name: "Challenge Docs"
+  short_description: "文書レビューの指摘や追加・削除案に反証を試み、根拠と必要性を再検証"

@@ -1,0 +1,3 @@
+interface:
+  display_name: "Review Tests"
+  short_description: "言語共通の基準でテストの回帰検知力・独立性・構成・保守性をレビュー"

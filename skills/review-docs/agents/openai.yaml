@@ -1,0 +1,3 @@
+interface:
+  display_name: "Review Docs"
+  short_description: "既存文書の正しさ・矛盾・不足・不要な記述を検討し、変更案を提示"

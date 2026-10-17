@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review"
+  short_description: "差分による挙動の変化・バグ・テストの穴だけを指摘し、修正はしない"
+  default_prompt: "$review を使って、現在の差分をレビューして指摘を列挙してください。修正はしないでください。"

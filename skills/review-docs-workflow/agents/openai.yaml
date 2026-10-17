@@ -1,0 +1,3 @@
+interface:
+  display_name: "Review Docs Workflow"
+  short_description: "文書の内容検討・反証・構成と表現の確認を順に行い、修正せず指摘を整理"
