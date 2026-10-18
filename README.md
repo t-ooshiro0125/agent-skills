@@ -89,3 +89,7 @@ agent-skills/
 
 - [Codex のスキル配置先とシンボリックリンクの対応](https://learn.chatgpt.com/docs/build-skills#where-codex-loads-local-skills)
 - [スキルの呼び出し方法](https://learn.chatgpt.com/docs/build-skills#how-chatgpt-and-codex-use-skills)
+
+## ライセンス
+
+このリポジトリは [MIT ライセンス](LICENSE)で公開しています。
