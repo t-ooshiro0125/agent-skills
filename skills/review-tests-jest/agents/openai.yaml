@@ -1,0 +1,3 @@
+interface:
+  display_name: "Review Tests Jest"
+  short_description: "共通基準に Jest 固有の非同期処理・mock・timer の観点を加えてレビュー"
