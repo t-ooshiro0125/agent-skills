@@ -25,6 +25,8 @@
 | [worktree-create](skills/worktree-create/SKILL.md) | Git worktree の作成・再利用 | [ガイド](docs/usage/worktree-create.md) |
 | [worktree-link-local](skills/worktree-link-local/SKILL.md) | 既存 worktree 間のローカルファイル共有 | [ガイド](docs/usage/worktree-link-local.md) |
 | [worktree-from-issue](skills/worktree-from-issue/SKILL.md) | Issue を起点とした worktree・共有環境の準備 | [ガイド](docs/usage/worktree-from-issue.md) |
+| [worktree-start](skills/worktree-start/SKILL.md) | 利用先の手順に従って既存 worktree の開発環境を起動 | [ガイド](docs/usage/worktree-start.md) |
+| [worktree-cleanup](skills/worktree-cleanup/SKILL.md) | worktree の一覧・削除と stale metadata の整理 | [ガイド](docs/usage/worktree-cleanup.md) |
 
 ## 導入方法
 

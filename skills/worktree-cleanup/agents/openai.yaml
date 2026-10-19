@@ -1,0 +1,3 @@
+interface:
+  display_name: "Worktree Cleanup"
+  short_description: "作業状態を確認して worktree の一覧・削除と stale metadata の整理を実行"
