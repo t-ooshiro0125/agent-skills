@@ -17,6 +17,7 @@
 | [review-tests](skills/review-tests/SKILL.md) | 言語共通のテストの回帰検知力・独立性・保守性をレビュー | [ガイド](docs/usage/review-tests.md) |
 | [review-tests-rspec](skills/review-tests-rspec/SKILL.md) | 共通基準に RSpec 固有の観点を加えてテストをレビュー | [ガイド](docs/usage/review-tests-rspec.md) |
 | [review-tests-jest](skills/review-tests-jest/SKILL.md) | 共通基準に Jest 固有の観点を加えてテストをレビュー | [ガイド](docs/usage/review-tests-jest.md) |
+| [write-pr-text](skills/write-pr-text/SKILL.md) | コミット済み差分と要件から PR タイトルと本文を作成 | [ガイド](docs/usage/write-pr-text.md) |
 | [implementation-challenge](skills/implementation-challenge/SKILL.md) | レビュー結果と議論の結論に対する反証 | [ガイド](docs/usage/implementation-challenge.md) |
 | [review-refactor](skills/review-refactor/SKILL.md) | 挙動を維持するリファクタ候補の提示 | [ガイド](docs/usage/review-refactor.md) |
 | [review-workflow](skills/review-workflow/SKILL.md) | レビュー・反証・リファクタ候補の確認を順に実行 | [ガイド](docs/usage/review-workflow.md) |
