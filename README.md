@@ -61,7 +61,7 @@ git pull --ff-only
 
 ## スキルの追加・更新
 
-作成・更新の方針は [AGENTS.md](AGENTS.md) に従ってください。配布用スキルは `skills/<skill-name>/SKILL.md` に配置し、先頭の YAML メタデータに `name` と `description` を記載します。
+作成・更新の方針は [AGENTS.md](AGENTS.md) に従ってください。開発時は [開発規約](docs/development.md)に従ってください。配布用スキルは `skills/<skill-name>/SKILL.md` に配置し、先頭の YAML メタデータに `name` と `description` を記載します。
 
 変更に応じて、次の項目を確認します。
 

@@ -1,3 +1,7 @@
+# 開発規約
+
+本リポジトリのブランチ作成、PR の作成、レビュー依頼前の確認は、[開発規約](docs/development.md)に従う。
+
 # スキルの登録
 
 このリポジトリのスキル登録、または `install-skills` の実行を依頼された場合は、[install-skills の手順](.agents/skills/install-skills/SKILL.md)を読み、それに従う。`install-skills` はこのリポジトリ専用とし、配布用スキルの登録対象に含めない。相対パスは、この `AGENTS.md` があるディレクトリを基準に解決する。
