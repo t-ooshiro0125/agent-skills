@@ -4,7 +4,7 @@
 
 ## 配布用スキル一覧
 
-依頼に `$<skill-name>` を付け、対象と期待する作業を指定します。
+Codex では `$<skill-name>`、Claude Code では `/<skill-name>` を依頼に付け、対象と期待する作業を指定します。
 
 | スキル | 用途 | 使い方 |
 | --- | --- | --- |
@@ -30,7 +30,7 @@
 
 ## 導入方法
 
-Codex CLI または IDE 拡張と、Git・Python 3 が利用できる環境を前提とします。登録スクリプトは macOS・Linux 向けです。スキルごとに必要な追加ツールは、各利用ガイドを参照してください。
+Codex CLI・IDE 拡張または Claude Code と、Git・Python 3 が利用できる環境を前提とします。登録スクリプトは macOS・Linux 向けです。スキルごとに必要な追加ツールは、各利用ガイドを参照してください。
 
 1. まだ取得していない場合は、任意の保存先でリポジトリを取得して移動します。
 
@@ -39,15 +39,15 @@ Codex CLI または IDE 拡張と、Git・Python 3 が利用できる環境を�
        cd agent-skills
    ```
 
-2. Codex CLI は取得したリポジトリのルートで起動し、IDE 拡張ではそのフォルダを開きます。
+2. 利用するエージェントの配置先を指定して登録します。次は Codex でユーザー全体に全スキルを登録する例です。エージェントを起動せず実行できます。
 
-3. 次のように登録を依頼します。
-
-   ```text
-   $install-skills このリポジトリのスキルを登録してください。
+   ```sh
+   python3 scripts/install.py "$HOME/.agents/skills"
    ```
 
-Codex が登録先を確認し、配布用の `skills/` フォルダ全体へのリンクを作成します。取得したリポジトリを移動・削除するとリンクが切れるため、そのまま残してください。登録後は `/skills` または `$` で読み込みを確認してください。登録の詳細は、[install-skills の利用ガイド](docs/usage/install-skills.md)を参照してください。
+各スキルのディレクトリへの個別リンクを作成します。Claude Code では `~/.claude/skills`、プロジェクト単位では対象プロジェクトの `.agents/skills` または `.claude/skills` を指定します。4通りの導入コマンド、選択登録、一括リンクからの移行、登録対象を減らす手順は [install-skills の利用ガイド](docs/usage/install-skills.md)を参照してください。Codex から `$install-skills` で登録を依頼することもできます。
+
+取得したリポジトリを移動・削除するとリンクや依存スキルの参照が切れるため、そのまま残してください。登録後は Codex では `/skills` または `$`、Claude Code では `/` の候補一覧で読み込みを確認してください。
 
 ## 更新方法
 
@@ -57,7 +57,7 @@ Codex が登録先を確認し、配布用の `skills/` フォルダ全体への
 git pull --ff-only
 ```
 
-新しいスキルもリンク先に反映されるため、再登録は不要です。
+新しいスキルを追加登録する場合は、インストーラーを再実行してください。名前を省略すると全登録、登録先に続けてスキル名を指定すると選択登録になります。指定外の既存リンクは削除しません。
 
 ## スキルの追加・更新
 
@@ -92,6 +92,7 @@ agent-skills/
 ## 参考資料
 
 - [Codex のスキル配置先とシンボリックリンクの対応](https://learn.chatgpt.com/docs/build-skills#where-codex-loads-local-skills)
+- [Claude Code のスキル配置先とシンボリックリンクの対応](https://code.claude.com/docs/en/skills#choose-where-skills-load)
 - [スキルの呼び出し方法](https://learn.chatgpt.com/docs/build-skills#how-chatgpt-and-codex-use-skills)
 
 ## ライセンス

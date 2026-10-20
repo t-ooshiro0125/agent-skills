@@ -1,14 +1,13 @@
-"""配布用スキルを一括リンクで登録し、旧個別リンクから移行する。
+"""配布用スキルを個別リンクで登録し、一括リンクから移行する。
 
-Git リポジトリ内では、登録するリンクをローカル除外設定に追加し、
-古い除外記録を整理する。既存項目は保護し、移行可能な旧リンクだけを削除する。
-
-使い方: python3 scripts/install.py <登録先ディレクトリ>
+使い方: python3 scripts/install.py <登録先ディレクトリ> [<skill-name> ...]
+削除:   python3 scripts/install.py <登録先ディレクトリ> --remove <skill-name> ...
 失敗前に完了した変更は残る。
 """
 
-from pathlib import Path
+import argparse
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Tuple
 import os
 import subprocess
@@ -18,23 +17,19 @@ import sys
 BEGIN = "# BEGIN agent-skills"
 END = "# END agent-skills"
 LINK_NAME = "agent-skills"
+RESERVED_NAMES = {LINK_NAME, "install-skills"}
 
 
 @dataclass(frozen=True)
 class InstallPlan:
-    """計画時点の登録可否と、リンク移行・除外記録の整理対象。
-
-    can_register は登録済みの場合も True。適用時には状態を再検証する。
-    登録不可でも exclude_paths_to_remove の除外記録を掃除してから停止する。
-    このフィールドは除外記録を指定するもので、既存項目の削除は指示しない。
-    """
+    """変更対象と、既存項目を保護するための計画時点の判定。"""
     source_root: Path
+    links: Tuple[Path, ...]
     bundle_link: Path
-    can_register: bool
-    legacy_links_to_remove: Tuple[Path, ...] = ()
-    exclude_paths_to_remove: Tuple[Path, ...] = ()
-    already_registered: bool = False
-    protected_legacy_links: Tuple[Path, ...] = ()
+    migrate_bundle: bool = False
+    remove: bool = False
+    conflicts: Tuple[Path, ...] = ()
+    stale_excludes: Tuple[Path, ...] = ()
 
 
 # Git リポジトリの照会
@@ -135,18 +130,6 @@ def update_exclude(repository, patterns, removals=()):
     return path
 
 
-def configure_git_excludes(repository, plan):
-    relative_link = plan.bundle_link.relative_to(repository)
-    patterns = [exclusion_pattern(relative_link)] if plan.can_register else []
-    removal_patterns = [exclusion_pattern(target.relative_to(repository)) for target in plan.exclude_paths_to_remove]
-    exclude = update_exclude(repository, patterns, removal_patterns)
-    if plan.can_register:
-        result = git(repository, "check-ignore", "--no-index", "-q", "--", relative_link.as_posix())
-        if result.returncode:
-            raise ValueError(f"Git の除外が有効ではありません: {plan.bundle_link}（.gitignore 等を確認してください）")
-    print(f"Git 除外設定: {exclude}")
-
-
 # リンクの判定・登録計画・適用
 
 def same_link(target, source):
@@ -158,97 +141,155 @@ def same_link(target, source):
         return False
 
 
-def plan_legacy_migration(source_root, destination, repository):
-    """移行可能な旧リンクと、古い除外記録の削除対象を調べる。"""
-    legacy_links_to_remove = []
-    protected_legacy_links = []
-    old_targets = [destination / source.name for source in sorted(source_root.iterdir())
-                   if (source / "SKILL.md").is_file() and source.name != LINK_NAME]
-    for old_target in old_targets:
-        source = source_root / old_target.name
-        if same_link(old_target, source):
-            if repository and is_tracked(repository, old_target):
-                protected_legacy_links.append(old_target)
-            else:
-                legacy_links_to_remove.append(old_target)
-    return tuple(legacy_links_to_remove), tuple(old_targets), tuple(protected_legacy_links)
+def occupied(target):
+    return target.exists() or target.is_symlink()
 
 
-def plan_installation(source_root, destination, repository):
-    """登録可否、移行する旧リンク、除外記録の削除対象を決める。"""
-    target = destination / LINK_NAME
-    if repository and is_tracked(repository, target):
-        return InstallPlan(source_root=source_root, bundle_link=target, can_register=False, exclude_paths_to_remove=(target,))
-    already_registered = same_link(target, source_root)
-    if not already_registered and (target.exists() or target.is_symlink()):
-        return InstallPlan(source_root=source_root, bundle_link=target, can_register=False, exclude_paths_to_remove=(target,))
+def validate_names(names):
+    for name in names:
+        if not name or name in {".", ".."} or Path(name).name != name or name in RESERVED_NAMES:
+            raise ValueError(f"配布用スキルの名前を指定してください: {name}")
 
-    legacy_links_to_remove, exclude_paths_to_remove, protected_legacy_links = plan_legacy_migration(
-        source_root, destination, repository,
-    )
-    return InstallPlan(
-        source_root=source_root,
-        bundle_link=target,
-        can_register=True,
-        legacy_links_to_remove=legacy_links_to_remove,
-        exclude_paths_to_remove=exclude_paths_to_remove,
-        already_registered=already_registered,
-        protected_legacy_links=protected_legacy_links,
-    )
+
+def link_conflicts(target, source, repository):
+    return ((repository is not None and is_tracked(repository, target))
+            or (occupied(target) and not same_link(target, source)))
+
+
+def plan_installation(source_root, destination, repository, skill_names=(), remove=False):
+    """対象を事前検証する。計画だけではファイルを書き換えない。"""
+    names = tuple(sorted(set(skill_names)))
+    validate_names(names)
+    available = tuple(sorted(path.name for path in source_root.iterdir()
+                             if path.name not in RESERVED_NAMES and path.is_dir()
+                             and (path / "SKILL.md").is_file()))
+    bundle = destination / LINK_NAME
+    own_bundle = same_link(bundle, source_root)
+    if remove:
+        if not names:
+            raise ValueError("削除するスキルの名前を明示してください")
+        if own_bundle:
+            raise ValueError("一括リンクを個別リンクへ移行してから --remove を実行してください")
+    else:
+        unknown = set(names) - set(available)
+        if unknown:
+            raise ValueError("存在しない配布用スキル: " + ", ".join(sorted(unknown)))
+        # 一括リンクで利用できていたスキルを暗黙に減らさない。
+        if not names or own_bundle:
+            names = available
+        if not names:
+            raise ValueError("登録できる配布用スキルがありません")
+
+    links = tuple(destination / name for name in names)
+    conflicts = tuple(target for target in links
+                      if link_conflicts(target, source_root / target.name, repository))
+    stale = list(conflicts)
+    if own_bundle and repository and is_tracked(repository, bundle):
+        conflicts += (bundle,)
+        stale.append(bundle)
+    elif not own_bundle:
+        stale.append(bundle)
+    return InstallPlan(source_root, links, bundle, own_bundle, remove, conflicts, tuple(stale))
+
+
+def validate_plan(plan, repository):
+    if plan.conflicts:
+        raise ValueError("登録先に別の既存項目または Git 管理対象があります: "
+                         + ", ".join(str(path) for path in plan.conflicts))
+    if plan.migrate_bundle:
+        if not same_link(plan.bundle_link, plan.source_root) or (
+                repository and is_tracked(repository, plan.bundle_link)):
+            raise ValueError(f"移行中に一括リンクの状態が変わりました: {plan.bundle_link}")
+    elif same_link(plan.bundle_link, plan.source_root):
+        raise ValueError(f"計画後に一括リンクが作成されました: {plan.bundle_link}")
+    for target in plan.links:
+        validate_target(plan, target, repository)
+
+
+def validate_target(plan, target, repository):
+    source = plan.source_root / target.name
+    if link_conflicts(target, source, repository):
+        raise ValueError(f"処理中に既存項目の状態が変わりました: {target}")
+    if not plan.remove and not (source / "SKILL.md").is_file():
+        raise ValueError(f"登録元のスキルが見つかりません: {source}")
 
 
 def apply_link_migration(plan, repository):
-    """一括リンクを作成してから、検証済みの旧個別リンクを削除する。"""
-    if not plan.can_register:
-        raise ValueError(f"登録先に別の既存項目または Git 管理対象があります: {plan.bundle_link}")
-    if repository and is_tracked(repository, plan.bundle_link):
-        raise ValueError(f"登録中に Git 管理対象になりました: {plan.bundle_link}")
-    plan.bundle_link.parent.mkdir(parents=True, exist_ok=True)
-    if not same_link(plan.bundle_link, plan.source_root):
-        if plan.bundle_link.exists() or plan.bundle_link.is_symlink():
-            raise ValueError(f"登録中に既存項目の状態が変わりました: {plan.bundle_link}")
-        plan.bundle_link.symlink_to(plan.source_root, target_is_directory=True)
-        print(f"登録: {plan.bundle_link}")
-    for target in plan.legacy_links_to_remove:
-        source = plan.source_root / target.name
-        if not same_link(target, source) or (repository and is_tracked(repository, target)):
-            raise ValueError(f"移行中に既存リンクの状態が変わりました: {target}")
-        target.unlink()
-        print(f"個別リンクから移行: {target}")
+    """適用前と各変更の直前に保護条件を再検証する。"""
+    validate_plan(plan, repository)
+    for target in plan.links:
+        validate_target(plan, target, repository)
+        if plan.remove:
+            if target.is_symlink():
+                target.unlink()
+                print(f"削除: {target}")
+            else:
+                print(f"未登録: {target}")
+        elif same_link(target, plan.source_root / target.name):
+            print(f"登録済み: {target}")
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.symlink_to(plan.source_root / target.name, target_is_directory=True)
+            print(f"登録: {target}")
+    if plan.migrate_bundle:
+        # 全リンクの作成を確認してから、一括リンクだけを削除する。
+        validate_plan(plan, repository)
+        if not all(same_link(target, plan.source_root / target.name) for target in plan.links):
+            raise ValueError("個別リンクの作成を確認できないため、一括リンクを維持します")
+        plan.bundle_link.unlink()
+        print(f"一括リンクから移行: {plan.bundle_link}")
 
 
 # 登録の進行とコマンドライン入口
 
-def report_installation_plan(plan):
-    if plan.already_registered:
-        print(f"登録済み: {plan.bundle_link}")
-    for target in plan.protected_legacy_links:
-        print(f"移行対象外（Git 管理対象）: {target}")
+def configure_git_excludes(repository, plan):
+    patterns = []
+    if not plan.conflicts and not plan.remove:
+        patterns = [exclusion_pattern(target.relative_to(repository)) for target in plan.links]
+    removals = [exclusion_pattern(target.relative_to(repository)) for target in plan.stale_excludes]
+    exclude = update_exclude(repository, patterns, removals)
+    for target in plan.links if patterns else ():
+        result = git(repository, "check-ignore", "--no-index", "-q", "--",
+                     target.relative_to(repository).as_posix())
+        if result.returncode:
+            raise ValueError(f"Git の除外が有効ではありません: {target}（.gitignore 等を確認してください）")
+    print(f"Git 除外設定: {exclude}")
 
 
-def install(destination):
+def install(destination, skill_names=(), remove=False):
     destination = Path(destination).expanduser().resolve()
-    repository = repository_for(destination)
     source_root = Path(__file__).resolve().parent.parent / "skills"
     if not source_root.is_dir():
         raise ValueError(f"登録元が見つかりません: {source_root}")
     if destination == source_root or source_root in destination.parents:
         raise ValueError("登録元の skills/ 内には登録できません")
-    plan = plan_installation(source_root, destination, repository)
-    report_installation_plan(plan)
+    repository = repository_for(destination)
+    plan = plan_installation(source_root, destination, repository, skill_names, remove)
     if repository:
-        # リンクを変更する前に除外の有効性を確認する。
-        # 登録不可の場合も、競合する項目の古い除外記録を削除する。
+        # マーカーと除外の有効性をリンク変更前に確認する。
+        # 競合する項目の古い除外記録だけは、登録不可の場合も取り除く。
         configure_git_excludes(repository, plan)
     apply_link_migration(plan, repository)
+    if repository:
+        removed = plan.links if plan.remove else ((plan.bundle_link,) if plan.migrate_bundle else ())
+        if removed:
+            update_exclude(repository, [], [exclusion_pattern(target.relative_to(repository))
+                                            for target in removed])
 
 
 def main():
-    if len(sys.argv) != 2 or not sys.argv[1]:
-        print("使い方: python3 scripts/install.py <登録先ディレクトリ>", file=sys.stderr)
-        return 2
+    parser = argparse.ArgumentParser(description="配布用スキルを個別リンクで登録する")
+    parser.add_argument("destination", help="登録先ディレクトリ（必須）")
+    parser.add_argument("skills", nargs="*", help="登録するスキル名（省略時は全スキル）")
+    parser.add_argument("--remove", nargs="+", metavar="SKILL", help="明示したスキルのリンクだけを削除する")
+    args = parser.parse_args()
+    if not args.destination:
+        parser.error("登録先ディレクトリを指定してください")
+    if args.remove is not None and args.skills:
+        parser.error("登録と削除は同時に指定できません")
     try:
-        install(sys.argv[1])
+        install(args.destination, args.remove if args.remove is not None else args.skills,
+                remove=args.remove is not None)
     except (OSError, ValueError) as error:
         print(f"エラー: {error}", file=sys.stderr)
         return 1
