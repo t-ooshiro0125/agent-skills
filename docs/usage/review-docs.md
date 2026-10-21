@@ -10,6 +10,6 @@
 $review-docs skills/review-tests-rspec/SKILL.md 全体を確認し、内容の誤りと追加・削除した方がよい点を挙げてください。
 ```
 
-手順と判断基準は [SKILL.md](../../skills/review-docs/SKILL.md)、表示用メタデータは [agents/openai.yaml](../../skills/review-docs/agents/openai.yaml) を参照してください。
-
 指摘への反証は [challenge-docs](challenge-docs.md)、内容検討・反証・構成と表現の確認をまとめて依頼する場合は [review-docs-workflow](review-docs-workflow.md) を使います。表現・構成だけの整理には、[edit-rulebook](edit-rulebook.md) または [edit-prose](edit-prose.md) を使います。
+
+手順と判断基準は [SKILL.md](../../skills/review-docs/SKILL.md)、表示用メタデータは [agents/openai.yaml](../../skills/review-docs/agents/openai.yaml) を参照してください。
