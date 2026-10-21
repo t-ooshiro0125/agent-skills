@@ -10,7 +10,7 @@ Codex では `$<skill-name>`、Claude Code では `/<skill-name>` を依頼に�
 | --- | --- | --- |
 | [edit-prose](skills/edit-prose/SKILL.md) | 既存の日本語文章の構文確認・リライト | [ガイド](docs/usage/edit-prose.md) |
 | [edit-rulebook](skills/edit-rulebook/SKILL.md) | 指示・ルール・運用文書の確認・リライト | [ガイド](docs/usage/edit-rulebook.md) |
-| [review-docs](skills/review-docs/SKILL.md) | 文書の正しさ・不足・不要な記述を検討 | [ガイド](docs/usage/review-docs.md) |
+| [review-docs](skills/review-docs/SKILL.md) | 文書の正しさ・不足・不要な記述と、情報の配置・移動・分割を検討 | [ガイド](docs/usage/review-docs.md) |
 | [challenge-docs](skills/challenge-docs/SKILL.md) | 文書レビューの指摘や追加・削除案への反証 | [ガイド](docs/usage/challenge-docs.md) |
 | [review-docs-workflow](skills/review-docs-workflow/SKILL.md) | 文書の内容検討・反証・構成と表現の確認を順に実行 | [ガイド](docs/usage/review-docs-workflow.md) |
 | [review](skills/review/SKILL.md) | 差分の挙動・バグ・テストの穴をレビュー | [ガイド](docs/usage/review.md) |
