@@ -1,0 +1,3 @@
+interface:
+  display_name: "Revise Docs Workflow"
+  short_description: "文書の内容確認・指摘の検証からリライト・修正後の確認までを一続きに進める"
