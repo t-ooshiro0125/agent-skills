@@ -133,7 +133,16 @@ python3 revision.py --state work.json brief --file revised-brief.json
 
 一回の修正を確認する前に同じ対象へ次の修正はできない。保留は `next` で飛ばして他を進める。新しい根拠や判断を得た対象は理由付きで再確認待ちへ戻す。
 
-反復上限でまだ `needs_revision` の基準がある場合、具体案・理由・必要な判断が揃うまで記録を受け付けず、揃ったら `held` として保存する。上限到達を合格にせず、上限後は追加修正せずに残る案を報告する。
+反復上限でまだ `needs_revision` の基準がある場合、具体案・理由・必要な判断が揃うまで記録を受け付けず、揃ったら `held` として保存する。上限到達を合格にせず、上限のままでは追加修正せずに残る案を報告する。
+
+必要な情報・判断が加わり、現行の形式2状態で編集を再開する場合は、理由付きで上限を明示的に増やせる。上限だけを増やしても保留・本文・既存の確認結果は変えず、履歴と反復回数を保つ。対象は新しい根拠とともに再確認待ちへ戻し、修正・確認する。全文確認もやり直す。
+
+```sh
+python3 revision.py --state work.json extend-limit --max-iterations 6 --reason "不足していた判断が確定し、残る修正と再確認を行う"
+python3 revision.py --state work.json invalidate --units u0004 --reason "追加された判断の根拠と内容"
+```
+
+現在と同じ上限や引き下げは拒否する。上限に達しただけで自動的に増やしたり、状態 JSON を直接編集して回数を消したりしない。
 
 ## 全文の確認と出力
 
@@ -175,6 +184,6 @@ python3 revision.py --state work.json finish --output revised.md --report result
 python3 revision.py --state work.json upgrade --brief brief.json
 ```
 
-追加の依頼の確認に必要なら `--max-iterations` で上限を明示的に増やせるが、過去の回数は消さない。旧状態・作業ログ・原文などは指定された公開範囲に従って保持する。記録の充足と、依頼者が理解できる修正文になったかは別に確認する。
+移行と同時に上限を増やす場合は `upgrade --max-iterations` を使う。移行後の形式2には前述の `extend-limit` を使い、いずれも過去の回数は消さない。旧状態・作業ログ・原文などは指定された公開範囲に従って保持する。記録の充足と、依頼者が理解できる修正文になったかは別に確認する。
 
 補助スクリプトの変更時は、依存導入済みの環境でスキルディレクトリから `python3 tests/test_revision.py` を実行する。

@@ -774,6 +774,39 @@ class CriterionWorkflowTests(unittest.TestCase):
             revision.finish(upgraded)
         self.assertEqual(legacy["format"], 1)
 
+    def test_extend_limit_retains_hold_attempts_history_and_requires_explicit_recheck(self):
+        value = state("条件が未定の説明。\n", limit=1)
+        unit = value["units"][0]
+        revision.record_review(value, unit["id"], revision.token(value, unit), hold())
+        final(value)
+        old = copy.deepcopy(value)
+        revision.extend_limit(value, 2, "上限値の根拠と説明追加の判断が得られた")
+        self.assertEqual(unit["state"], "held")
+        self.assertEqual(unit["attempts"], 1)
+        self.assertEqual(unit["history"], old["units"][0]["history"])
+        self.assertEqual(unit["review"], old["units"][0]["review"])
+        self.assertEqual(revision.render(value), revision.render(old))
+        self.assertIsNone(value["final_review"])
+        self.assertEqual(value["events"][-1]["previous_max_iterations"], 1)
+        self.assertEqual(value["events"][-1]["max_iterations"], 2)
+        with self.assertRaisesRegex(revision.RevisionError, "held unit"):
+            revision.edit(value, unit["id"], revision.token(value, unit), "根拠のある説明。\n")
+        revision.invalidate(value, [unit["id"]], "上限値を確認したので説明へ反映する")
+        revision.edit(value, unit["id"], revision.token(value, unit), "根拠のある説明。\n")
+        revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit, "confirmed"))
+        self.assertEqual(unit["attempts"], 2)
+        final(value)
+        self.assertTrue(revision.finish(value)["fully_resolved"])
+
+    def test_extend_limit_rejects_reset_or_unexplained_changes_without_mutation(self):
+        value = state("対象。\n", limit=3)
+        for maximum, reason in [(2, "下げる"), (3, "同じ"), (True, "不正な型"),
+                                (4.5, "不正な型"), (4, " ")]:
+            before = copy.deepcopy(value)
+            with self.subTest(maximum=maximum, reason=reason), self.assertRaises(revision.RevisionError):
+                revision.extend_limit(value, maximum, reason)
+            self.assertEqual(value, before)
+
 
 class CliTests(unittest.TestCase):
     def setUp(self):
@@ -900,6 +933,35 @@ class CliTests(unittest.TestCase):
         output = self.root / "output.md"
         self.cli("finish", "--output", output, success=False)
         self.assertFalse(output.exists())
+
+    def test_cli_resumes_current_state_at_the_limit_after_new_information(self):
+        value = state("条件が未定の説明。\n", limit=1)
+        unit = value["units"][0]
+        revision.record_review(value, unit["id"], revision.token(value, unit), hold())
+        revision.save(self.path, value)
+        self.cli("invalidate", "--units", unit["id"], "--reason", "必要な上限値を確認できた")
+        target = json.loads(self.cli("show", "--unit", unit["id"]).stdout)["target"]
+        edit_file = self.root / "edit.md"
+        edit_file.write_text("根拠のある説明。\n")
+        before = self.path.read_bytes()
+        self.cli("edit", "--unit", unit["id"], "--token", target["token"],
+                 "--file", edit_file, success=False)
+        self.assertEqual(self.path.read_bytes(), before)
+        extended = self.cli("extend-limit", "--max-iterations", 2,
+                            "--reason", "得られた根拠を反映し再確認する")
+        self.assertEqual(json.loads(extended.stdout)["max_iterations"], 2)
+        current = revision.load(self.path)
+        self.assertEqual(current["format"], 2)
+        self.assertEqual(current["max_iterations"], 2)
+        self.assertEqual(current["units"][0]["attempts"], 1)
+        self.assertEqual(current["units"][0]["history"], value["units"][0]["history"])
+        self.cli("edit", "--unit", unit["id"], "--token", target["token"], "--file", edit_file)
+        current = revision.load(self.path)
+        target = json.loads(self.cli("show", "--unit", unit["id"]).stdout)["target"]
+        result_file = self.root / "result.json"
+        result_file.write_text(json.dumps(result_for(current, current["units"][0], "confirmed")))
+        self.cli("record", "--unit", unit["id"], "--token", target["token"], "--file", result_file)
+        self.assertEqual(revision.load(self.path)["units"][0]["attempts"], 2)
 
     def test_final_review_rejects_non_object_json_without_changing_state(self):
         self.cli("init", "--original", self.original, "--brief", self.brief)

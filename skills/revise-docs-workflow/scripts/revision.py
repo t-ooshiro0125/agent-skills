@@ -243,6 +243,17 @@ def update_brief(state, brief):
     invalidate(state, [u["id"] for u in state["units"]], "document brief/criteria changed")
 
 
+def extend_limit(state, maximum, reason):
+    require_text(reason, "iteration limit extension reason")
+    previous = state["max_iterations"]
+    if type(maximum) is not int or maximum <= previous:
+        raise RevisionError("new iteration limit must be an integer greater than the current limit")
+    state["max_iterations"] = maximum
+    touch(state, reason)
+    state["events"][-1].update({"action": "extend_limit", "previous_max_iterations": previous,
+                                "max_iterations": maximum})
+
+
 def make_unit(state, text, kind, parents=()):
     uid = f"u{state['next_id']:04d}"
     state["next_id"] += 1
@@ -425,6 +436,7 @@ def history(state, uid):
 def status(state):
     refresh(state)
     return {"document_token": document_token(state), "revision": state["revision"],
+            "max_iterations": state["max_iterations"],
             "document_plan": state["document_plan"],
             "document_criteria": criteria_for(state, "document", state["document_plan"]),
             "counts": dict(Counter(u["state"] for u in state["units"])),
@@ -806,6 +818,9 @@ def parser():
     migrate = sub.add_parser("upgrade")
     migrate.add_argument("--brief", required=True, type=Path)
     migrate.add_argument("--max-iterations", type=int)
+    extend = sub.add_parser("extend-limit")
+    extend.add_argument("--max-iterations", required=True, type=int)
+    extend.add_argument("--reason", required=True)
     sub.add_parser("next")
     sub.add_parser("status")
     show = sub.add_parser("show")
@@ -898,6 +913,9 @@ def main(argv=None):
                 result = status(state)
             elif command == "brief":
                 update_brief(state, read_json(args.file))
+                result = status(state)
+            elif command == "extend-limit":
+                extend_limit(state, args.max_iterations, args.reason)
                 result = status(state)
             elif command == "final-review":
                 final_review(state, args.token, read_json(args.file))
