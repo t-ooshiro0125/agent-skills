@@ -139,6 +139,49 @@ def legacy_released_historical_hold(outcome="confirmed"):
 
 
 class SegmentationTests(unittest.TestCase):
+    def test_split_edited_text_does_not_match_an_unrelated_original_excerpt(self):
+        original = "Original target.\n\nUnrelated unique fragment.\n"
+        value = state(original)
+        parent = value["units"][0]
+        self.assertEqual(revision.view(value, parent)["target"]["original_scope"], "matching_excerpt")
+        parts = ["Unrelated unique fragment.\n", "\nRevised continuation.\n\n"]
+        revision.edit(value, parent["id"], revision.token(value, parent), "".join(parts))
+        revision.record_review(value, parent["id"], revision.token(value, parent), result_for(value, parent, "confirmed"))
+        ids = revision.split_unit(value, parent["id"], revision.token(value, parent), parts)
+        child = revision.unit_by_id(value, ids[0])
+        shown = revision.view(value, child)["target"]
+        self.assertEqual(shown["original_scope"], "whole_document")
+        self.assertEqual(shown["original_text"], original)
+        revision.annotate(value, child["id"], revision.token(value, child), {"original_lines": [1, 1]})
+        shown = revision.view(value, child)["target"]
+        self.assertEqual(shown["original_scope"], "specified_lines")
+        self.assertEqual(shown["original_text"], "Original target.\n")
+
+    def test_reorder_preserves_quote_and_other_protected_block_boundaries(self):
+        value = state("Outside.\n\n> first\n> second\n\nAfter.\n")
+        outside, quote, after = value["units"]
+        ids = revision.split_unit(value, quote["id"], revision.token(value, quote),
+                                  ["> first\n", "> second\n\n"])
+        before = copy.deepcopy(value)
+        with self.assertRaisesRegex(revision.RevisionError, "quote"):
+            revision.reorder(value, [ids[0], outside["id"], ids[1], after["id"]])
+        self.assertEqual(value, before)
+        revision.reorder(value, [*ids, outside["id"], after["id"]])
+        self.assertEqual(revision.render(value), "> first\n> second\n\nOutside.\n\nAfter.\n")
+        for text in ("Outside.\n\n" + TICKS + "\ncode\n", "Outside.\n\n<!-- open\n",
+                     "# Heading\n\nPlain.", "[ref]: https://example.test/\n\nText [ref]."):
+            with self.subTest(text=text):
+                value = state(text)
+                before = copy.deepcopy(value)
+                with self.assertRaisesRegex(revision.RevisionError, "boundaries"):
+                    revision.reorder(value, [u["id"] for u in reversed(value["units"])])
+                self.assertEqual(value, before)
+        for block in (TICKS + "\ncode\n" + TICKS + "\n\n", "<!-- closed -->\n\n", "# Heading\n\n"):
+            with self.subTest(block=block):
+                value = state("Outside.\n\n" + block)
+                revision.reorder(value, [u["id"] for u in reversed(value["units"])])
+                self.assertEqual(revision.render(value), block + "Outside.\n\n")
+
     def test_edit_and_reorder_preserve_the_complete_leading_bom_prefix(self):
         for count in (1, 2):
             with self.subTest(count=count):
@@ -779,7 +822,7 @@ class SegmentationTests(unittest.TestCase):
                               [before_id, ids[1], ids[0], ids[2], after_id],
                               [before_id, ids[0], ids[2], ids[1], after_id]):
                     before = copy.deepcopy(value)
-                    with self.assertRaisesRegex(revision.RevisionError, "table headers and rows"):
+                    with self.assertRaisesRegex(revision.RevisionError, "quote lines" if prefix else "table headers and rows"):
                         revision.reorder(value, order)
                     self.assertEqual(value, before)
                 revision.reorder(value, [*ids, before_id, after_id])
@@ -808,7 +851,7 @@ class SegmentationTests(unittest.TestCase):
                 for order in ([before_id, ids[0], after_id, ids[1]],
                               [before_id, ids[1], ids[0], after_id]):
                     before = copy.deepcopy(value)
-                    with self.assertRaisesRegex(revision.RevisionError, "list items"):
+                    with self.assertRaisesRegex(revision.RevisionError, "quote lines" if first.startswith(">") else "list items"):
                         revision.reorder(value, order)
                     self.assertEqual(value, before)
                 revision.reorder(value, [*ids, before_id, after_id])
@@ -827,6 +870,53 @@ class SegmentationTests(unittest.TestCase):
 
 
 class ReviewTests(unittest.TestCase):
+    def test_repeated_split_merge_keeps_annotation_storage_bounded_and_history_complete(self):
+        value = state("ab")
+        unit = value["units"][0]
+        revision.annotate(value, unit["id"], revision.token(value, unit),
+                          {"context_note": "Original annotation", "original_lines": [1, 1]})
+        original = copy.deepcopy(unit)
+        sizes = []
+        for iteration in range(24):
+            parent = value["units"][0]
+            ids = revision.split_unit(value, parent["id"], revision.token(value, parent), ["a", "b"])
+            revision.merge_units(value, ids)
+            size = len(json.dumps(value))
+            self.assertLess(size, 400_000, f"annotation storage grew too much at cycle {iteration + 1}")
+            sizes.append(size)
+        self.assertLess(sizes[-1], sizes[7] * 4)
+        current = value["units"][0]
+        records = revision.history(value, current["id"])["records"]
+        self.assertIn(original, records)
+        self.assertEqual({record["id"] for record in records},
+                         {u["id"] for u in value["retired"] + value["units"]})
+        self.assertEqual(revision.view(value, current)["reference_only"]["notes"]["inherited_from"], current["parents"])
+        revision.annotate(value, current["id"], revision.token(value, current), {"context_note": "New annotation"})
+        ids = revision.split_unit(value, current["id"], revision.token(value, current), ["a", "b"])
+        for uid in ids:
+            records = revision.history(value, uid)["records"]
+            self.assertEqual(next(record for record in records if record["id"] == current["id"])["notes"]["context_note"],
+                             "New annotation")
+
+    def test_legacy_inherited_notes_are_retained_once_and_referenced_by_new_children(self):
+        value = state("a\n\nb\n")
+        first, second = value["units"]
+        revision.annotate(value, first["id"], revision.token(value, first), {"findings": ["First note"]})
+        revision.annotate(value, second["id"], revision.token(value, second), {"context_note": "Second note"})
+        uid = revision.merge_units(value, [first["id"], second["id"]])
+        parent = revision.unit_by_id(value, uid)
+        parent["notes"] = {"inherited": [copy.deepcopy(first["notes"]), copy.deepcopy(second["notes"])],
+                           "inherited_plans": [copy.deepcopy(first["plan"]), copy.deepcopy(second["plan"])]}
+        legacy = copy.deepcopy(parent)
+        ids = revision.split_unit(value, uid, revision.token(value, parent), ["a\n\n", "b\n"])
+        for child_id in ids:
+            child = revision.unit_by_id(value, child_id)
+            self.assertEqual(child["notes"], {"inherited_from": [uid]})
+            records = revision.history(value, child_id)["records"]
+            self.assertIn(legacy, records)
+            self.assertEqual(next(record for record in records if record["id"] == first["id"])["notes"]["findings"],
+                             ["First note"])
+
     def test_migration_of_old_historical_releases_preserves_newer_passed_results(self):
         for outcome in ("confirmed", "unchanged"):
             for marker in ("null", "absent"):
@@ -1365,9 +1455,11 @@ class ReviewTests(unittest.TestCase):
         old = copy.deepcopy(unit)
         revision.merge_units(value, [u["id"] for u in value["units"][:2]])
         self.assertIn(old, value["retired"])
-        self.assertEqual(value["units"][0]["notes"]["inherited"][0]["findings"], ["条件が不明"])
+        self.assertIn(old["id"], value["units"][0]["notes"]["inherited_from"])
         records = revision.history(value, value["units"][0]["id"])["records"]
         self.assertIn(old, records)
+        self.assertEqual(next(record for record in records if record["id"] == old["id"])["notes"]["findings"],
+                         ["条件が不明"])
         self.assertEqual(revision.history(value, old["id"])["records"][0], old)
 
     def test_regrouping_rejects_held_targets_without_losing_the_hold(self):

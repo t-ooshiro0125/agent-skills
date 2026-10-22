@@ -2,7 +2,7 @@
 """Keep local, versioned editing records; never call a model or judge prose."""
 import argparse
 from bisect import bisect_left, bisect_right
-from collections import Counter, OrderedDict
+from collections import Counter, OrderedDict, deque
 from functools import lru_cache
 import copy
 import hashlib
@@ -761,7 +761,7 @@ def view(state, unit):
         lines = source_lines(state["original"])
         original_text = "".join(lines[original[0] - 1:original[1]])
         original_scope = "specified_lines"
-    elif (unit["initial_text"] in state["original"] and
+    elif (not unit_changed(unit) and unit["initial_text"] in state["original"] and
           state["original"].find(unit["initial_text"]) == state["original"].rfind(unit["initial_text"])):
         original_text, original_scope = unit["initial_text"], "matching_excerpt"
     else:
@@ -783,9 +783,9 @@ def history(state, uid):
     units = {u["id"]: u for u in state["retired"] + state["units"]}
     if uid not in units:
         raise RevisionError(f"unknown unit: {uid}")
-    result, pending, seen = [], [uid], set()
+    result, pending, seen = [], deque([uid]), set()
     while pending:
-        current = pending.pop(0)
+        current = pending.popleft()
         if current in seen:
             continue
         seen.add(current)
@@ -1152,7 +1152,9 @@ def split_unit(state, uid, expected, parts):
         candidates = blocks(part)
         kind = candidates[0]["kind"] if len(candidates) == 1 else "group"
         child = make_unit(state, part, kind, [uid])
-        child["notes"] = copy.deepcopy(unit["notes"])
+        child["notes"] = {"inherited_from": [uid]}
+        if "original_lines" in unit["notes"]:
+            child["notes"]["original_lines"] = list(unit["notes"]["original_lines"])
         child["plan"] = copy.deepcopy(unit["plan"])
         child["context_ids"] = list(dict.fromkeys(unit["context_ids"] + neighbors))
         child["attempts"] = unit["attempts"]
@@ -1187,8 +1189,7 @@ def merge_units(state, ids):
     if all(u["kind"] == "table_rows" for u in old):
         kind = "table_rows"
     new = make_unit(state, text, kind, ids)
-    new["notes"]["inherited"] = [copy.deepcopy(u["notes"]) for u in old]
-    new["notes"]["inherited_plans"] = [copy.deepcopy(u["plan"]) for u in old]
+    new["notes"]["inherited_from"] = list(ids)
     if all(u["plan"] for u in old):
         new["plan"] = {
             name: "\n".join(dict.fromkeys(u["plan"][name] for u in old))
@@ -1249,7 +1250,7 @@ def split_structure_shapes(units):
     return result
 
 
-def table_and_list_spans(units):
+def structure_spans(units):
     text = "".join(unit["text"] for unit in units)
     lines = source_lines(text)
     offsets = [0]
@@ -1259,13 +1260,18 @@ def table_and_list_spans(units):
     for unit in units:
         ranges.append((unit["id"], offset, offset + len(unit["text"])))
         offset += len(unit["text"])
+    starts = [first for _, first, _ in ranges]
+    ends = [last for _, _, last in ranges]
     result = []
-    for node in syntax(text):
-        if node.type not in {"table_open", "bullet_list_open", "ordered_list_open"}:
+    protected = {"table_open", "bullet_list_open", "ordered_list_open", "blockquote_open",
+                 "fence", "code_block", "html_block", "heading_open", "hr", "definition"}
+    for node in SPLIT_MARKDOWN.parse(markdown_source(text)):
+        if node.type not in protected or node.map is None:
             continue
         start, end = (offsets[line] for line in node.map)
+        members = ranges[bisect_right(ends, start):bisect_left(starts, end)]
         result.append((node.type, tuple((uid, max(start - first, 0), min(end, last) - first)
-                                       for uid, first, last in ranges if first < end and start < last)))
+                                       for uid, first, last in members if first < last)))
     return result
 
 
@@ -1276,17 +1282,18 @@ def reorder(state, ids):
     if ids == current:
         return
     positions = {uid: index for index, uid in enumerate(ids)}
-    spans = table_and_list_spans(state["units"])
+    spans = structure_spans(state["units"])
     for kind, entries in spans:
         members = [positions[entry[0]] for entry in entries]
         if members != list(range(members[0], members[0] + len(members))):
-            structure = "table headers and rows" if kind == "table_open" else "list items"
+            structure = {"table_open": "table headers and rows", "bullet_list_open": "list items",
+                         "ordered_list_open": "list items", "blockquote_open": "quote lines"}.get(kind, "Markdown blocks")
             raise RevisionError(f"keep split {structure} together in order; merge the structure before reordering its parts")
     ordered = [unit_by_id(state, uid) for uid in ids]
     if leading_bom_count(state["initial_working"]) != leading_bom_count("".join(u["text"] for u in ordered)):
         raise RevisionError("keep the leading BOM at the start of the document when reordering")
-    if Counter(spans) != Counter(table_and_list_spans(ordered)):
-        raise RevisionError("reorder must preserve table and list boundaries")
+    if Counter(spans) != Counter(structure_spans(ordered)):
+        raise RevisionError("reorder must preserve Markdown block boundaries")
     state["units"] = ordered
     for unit in state["units"]:
         unit["generation"] += 1
