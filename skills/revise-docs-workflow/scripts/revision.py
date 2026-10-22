@@ -158,8 +158,89 @@ def require_text(value, name):
 def validate_brief(brief):
     if not isinstance(brief, dict):
         raise RevisionError("brief must be an object")
-    for name in ("purpose", "reader", "scope", "allowed_changes"):
+    for name in ("purpose", "reader", "reader_difficulties", "desired_understanding",
+                 "scope", "allowed_changes"):
         require_text(brief.get(name), name)
+    criteria = brief.get("criteria")
+    if not isinstance(criteria, list) or not criteria:
+        raise RevisionError("register the required criteria before processing targets")
+    ids, stages = set(), set()
+    for criterion in criteria:
+        if not isinstance(criterion, dict) or set(criterion) != {"id", "stage", "description"}:
+            raise RevisionError("each criterion requires only id, stage, and description")
+        uid = criterion["id"]
+        if not isinstance(uid, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", uid) or uid in ids:
+            raise RevisionError("criterion IDs must be unique stable identifiers")
+        if not isinstance(criterion["stage"], str) or criterion["stage"] not in {"unit", "document"}:
+            raise RevisionError("criterion stage must be unit or document")
+        require_text(criterion["description"], "criterion description")
+        ids.add(uid)
+        stages.add(criterion["stage"])
+    if stages != {"unit", "document"}:
+        raise RevisionError("register criteria for both unit and document checks")
+
+
+def criteria_for(state, stage, plan=None):
+    conditions = plan.get("criteria", {}) if isinstance(plan, dict) else {}
+    if not isinstance(conditions, dict):
+        conditions = {}
+    result = []
+    for definition in state["brief"]["criteria"]:
+        if definition["stage"] == stage:
+            item = {**definition, "condition": conditions.get(definition["id"])}
+            result.append({**item, "version": digest(item)})
+    return result
+
+
+def validate_plan(plan, criteria):
+    fields = {"problem", "evidence", "proposal", "preservation", "criteria"}
+    if not isinstance(plan, dict) or set(plan) != fields:
+        raise RevisionError("plan requires problem, evidence, proposal, preservation, and criteria; no results")
+    for name in ("problem", "evidence", "proposal"):
+        require_text(plan[name], name)
+    if not isinstance(plan["preservation"], list) or not plan["preservation"]:
+        raise RevisionError("plan preservation must be a nonempty list")
+    for value in plan["preservation"]:
+        require_text(value, "preservation")
+    conditions = plan["criteria"]
+    if not isinstance(conditions, dict) or set(conditions) != {c["id"] for c in criteria}:
+        raise RevisionError("plan must bind every registered criterion ID to a completion condition")
+    for value in conditions.values():
+        require_text(value, "completion condition")
+
+
+def set_plan(state, uid, expected, data):
+    unit = unit_by_id(state, uid) if uid else None
+    if unit:
+        check_token(state, unit, expected)
+    elif expected != document_token(state):
+        raise RevisionError("stale document token")
+    stage = "unit" if unit else "document"
+    validate_plan(data, criteria_for(state, stage))
+    previous = unit["plan"] if unit else state["document_plan"]
+    if data == previous:
+        return
+    entry = {"action": "plan", "plan": copy.deepcopy(data)}
+    if unit:
+        unit["plan"] = copy.deepcopy(data)
+        unit["history"].append(entry)
+    else:
+        state["document_plan"] = copy.deepcopy(data)
+        state["document_history"].append(entry)
+    touch(state, f"plan {uid or 'document'}")
+
+
+def update_brief(state, brief):
+    validate_brief(brief)
+    old = {c["id"]: c for c in state["brief"]["criteria"]}
+    new = {c["id"]: c for c in brief["criteria"]}
+    if old.keys() - new.keys() or any(new[key]["stage"] != value["stage"] for key, value in old.items()):
+        raise RevisionError("do not silently drop or move registered criteria; record not_applicable with a reason")
+    if brief == state["brief"]:
+        return
+    state["events"].append({"reason": "previous brief", "brief": copy.deepcopy(state["brief"])})
+    state["brief"] = copy.deepcopy(brief)
+    invalidate(state, [u["id"] for u in state["units"]], "document brief/criteria changed")
 
 
 def make_unit(state, text, kind, parents=()):
@@ -168,7 +249,7 @@ def make_unit(state, text, kind, parents=()):
     return {"id": uid, "kind": kind, "initial_text": text, "text": text,
             "inherited_change": False,
             "generation": 0, "state": "pending", "attempts": 0, "awaiting_review": False,
-            "notes": {}, "context_ids": [], "history": [], "review": None,
+            "notes": {}, "context_ids": [], "history": [], "review": None, "plan": None,
             "parents": list(parents)}
 
 
@@ -176,12 +257,40 @@ def initialize(original, working, brief, max_iterations=3):
     validate_brief(brief)
     if not isinstance(max_iterations, int) or max_iterations < 1:
         raise RevisionError("max_iterations must be a positive integer")
-    state = {"format": 1, "original": original, "original_hash": digest(original),
+    state = {"format": 2, "original": original, "original_hash": digest(original),
              "initial_working": working, "brief": copy.deepcopy(brief),
              "revision": 1, "next_id": 1, "max_iterations": max_iterations,
-             "units": [], "retired": [], "events": [], "final_review": None}
+             "units": [], "retired": [], "events": [], "final_review": None,
+             "document_plan": None, "document_history": []}
     state["units"] = [make_unit(state, b["text"], b["kind"]) for b in blocks(working)]
     return state
+
+
+def upgrade(state, brief, max_iterations=None):
+    if not isinstance(state, dict) or state.get("format") != 1:
+        raise RevisionError("upgrade requires a format 1 state")
+    if digest(state["original"]) != state["original_hash"]:
+        raise RevisionError("modified original snapshot")
+    validate_brief(brief)
+    limit = state["max_iterations"] if max_iterations is None else max_iterations
+    if type(limit) is not int or limit < state["max_iterations"]:
+        raise RevisionError("upgrade must preserve or explicitly increase the previous iteration limit")
+    result = copy.deepcopy(state)
+    result.update({"format": 2, "brief": copy.deepcopy(brief), "document_plan": None,
+                   "document_history": [], "final_review": None, "max_iterations": limit})
+    if state["final_review"]:
+        result["document_history"].append({"action": "legacy_review", "review": copy.deepcopy(state["final_review"])})
+    result["events"].append({"reason": "upgraded from format 1; previous brief",
+                             "brief": copy.deepcopy(state["brief"]),
+                             "previous_max_iterations": state["max_iterations"],
+                             "max_iterations": limit})
+    for unit in result["units"]:
+        unit["history"].append({"action": "legacy_review", "review": copy.deepcopy(unit["review"])})
+        unit["plan"], unit["review"], unit["state"] = None, None, "recheck"
+        unit["generation"] += 1
+    result["revision"] += 1
+    validate_state(result)
+    return result
 
 
 def unit_by_id(state, uid):
@@ -215,13 +324,14 @@ def context(state, unit):
 
 def token(state, unit):
     return digest({"id": unit["id"], "text": unit["text"], "generation": unit["generation"],
-                   "context": context(state, unit)})
+                   "context": context(state, unit), "plan": unit["plan"]})
 
 
 def refresh(state):
     for unit in state["units"]:
         review = unit.get("review")
-        if unit["state"] in TERMINAL and (not review or review.get("token") != token(state, unit)):
+        if unit["state"] in TERMINAL and (not isinstance(review, dict) or
+                                         review.get("token") != token(state, unit)):
             unit["state"] = "recheck"
             unit["awaiting_review"] = False
 
@@ -229,8 +339,10 @@ def refresh(state):
 def validate_state(state):
     if not isinstance(state, dict):
         raise RevisionError("state must be an object")
-    if state.get("format") != 1 or digest(state["original"]) != state["original_hash"]:
-        raise RevisionError("unsupported state or modified original snapshot")
+    if state.get("format") != 2:
+        raise RevisionError("unsupported state format; upgrade format 1 with a new brief and registered criteria")
+    if digest(state["original"]) != state["original_hash"]:
+        raise RevisionError("modified original snapshot")
     validate_brief(state["brief"])
     ids = [u["id"] for u in state["units"]]
     if len(ids) != len(set(ids)):
@@ -258,7 +370,8 @@ def save(path, state):
 
 def document_token(state):
     return digest({"revision": state["revision"], "text": render(state),
-                   "brief": state["brief"], "units": [token(state, u) for u in state["units"]]})
+                   "brief": state["brief"], "plan": state["document_plan"],
+                   "units": [token(state, u) for u in state["units"]]})
 
 
 def touch(state, reason):
@@ -287,8 +400,9 @@ def view(state, unit):
                        "text": unit["text"], "initial_working_text": unit["initial_text"],
                        "original_text": original_text, "original_scope": original_scope,
                        "state": unit["state"], "attempts": unit["attempts"],
-                       "max_iterations": state["max_iterations"]},
-            "reference_only": context(state, unit)}
+                       "max_iterations": state["max_iterations"], "plan": unit["plan"],
+                       "required_criteria": criteria_for(state, "unit", unit["plan"])},
+            "reference_only": context(state, unit), "previous_review": unit["review"]}
 
 
 def history(state, uid):
@@ -311,6 +425,8 @@ def history(state, uid):
 def status(state):
     refresh(state)
     return {"document_token": document_token(state), "revision": state["revision"],
+            "document_plan": state["document_plan"],
+            "document_criteria": criteria_for(state, "document", state["document_plan"]),
             "counts": dict(Counter(u["state"] for u in state["units"])),
             "units": [{"id": u["id"], "kind": u["kind"], "state": u["state"],
                        "token": token(state, u), "attempts": u["attempts"]} for u in state["units"]],
@@ -327,7 +443,7 @@ def next_target(state):
 def annotate(state, uid, expected, data):
     unit = unit_by_id(state, uid)
     check_token(state, unit, expected)
-    allowed = {"findings", "preservation", "criteria", "context_note", "original_lines", "context_ids"}
+    allowed = {"findings", "context_note", "original_lines", "context_ids"}
     if not isinstance(data, dict) or set(data) - allowed:
         raise RevisionError("unsupported annotation fields")
     refs = data.get("context_ids", unit["context_ids"])
@@ -352,7 +468,7 @@ def invalidate(state, ids, reason):
     targets = [unit_by_id(state, uid) for uid in ids]
     for unit in targets:
         unit["generation"] += 1
-        unit["state"], unit["awaiting_review"] = "recheck", False
+        unit["state"] = "recheck"
     touch(state, reason)
 
 
@@ -361,6 +477,7 @@ def edit(state, uid, expected, text, affected=(), all_affected=False):
     check_token(state, unit, expected)
     if text == unit["text"]:
         return
+    validate_plan(unit["plan"], criteria_for(state, "unit"))
     if unit["state"] == "held":
         raise RevisionError("held unit: invalidate with the new information/decision before editing")
     if unit["attempts"] >= state["max_iterations"]:
@@ -378,39 +495,67 @@ def edit(state, uid, expected, text, affected=(), all_affected=False):
     touch(state, f"edit {uid}")
 
 
-def validate_record(record):
-    if not isinstance(record, dict):
-        raise RevisionError("review record must be an object")
-    if record.get("outcome") not in {"confirmed", "unchanged", "needs_revision", "held"}:
-        raise RevisionError("invalid outcome")
-    for name in ("problem", "evidence"):
-        require_text(record.get(name), name)
-    for name in ("preservation", "criteria"):
-        if not isinstance(record.get(name), list) or not record[name]:
-            raise RevisionError(f"{name}: a nonempty list is required")
-        for value in record[name]:
-            require_text(value, name)
-    if not isinstance(record.get("checks"), list) or not record["checks"]:
-        raise RevisionError("checks: record what was checked and what was observed")
-    for check in record["checks"]:
-        if not isinstance(check, dict):
-            raise RevisionError("each check must be an object")
-        for name in ("criterion", "observation"):
-            value = check.get(name)
-            require_text(value, name)
-            if value.strip().casefold().strip(".。!！") in OPAQUE:
-                raise RevisionError("bare OK/change labels are not review observations")
-
-
 def held_details(record):
     for name in ("reason", "proposal", "required_decision"):
         require_text(record.get(name), name)
 
 
+def validate_checks(checks, criteria):
+    if not isinstance(checks, list):
+        raise RevisionError("checks must be a list covering every registered criterion")
+    expected = {c["id"]: c for c in criteria}
+    seen = set()
+    for check in checks:
+        fields = {"criterion_id", "criterion_version", "status", "observation"}
+        if not isinstance(check, dict) or fields - check.keys():
+            raise RevisionError("each check requires criterion_id, criterion_version, status, and observation")
+        uid = check["criterion_id"]
+        if not isinstance(uid, str) or uid not in expected or uid in seen:
+            raise RevisionError("unknown or duplicate criterion ID")
+        seen.add(uid)
+        if check["criterion_version"] != expected[uid]["version"]:
+            raise RevisionError(f"{uid}: stale criterion version")
+        status_value = check["status"]
+        if not isinstance(status_value, str) or status_value not in {"passed", "needs_revision", "held", "not_applicable"}:
+            raise RevisionError("invalid criterion status")
+        require_text(check["observation"], "observation")
+        if check["observation"].strip().casefold().strip(".。!！") in OPAQUE:
+            raise RevisionError("bare OK/change labels are not review observations")
+        if status_value == "not_applicable":
+            fields.add("reason")
+            require_text(check.get("reason"), "not_applicable reason")
+        elif status_value == "held" or (status_value == "needs_revision" and
+                                       set(check) & {"reason", "proposal", "required_decision"}):
+            fields.update({"reason", "proposal", "required_decision"})
+            held_details(check)
+        if set(check) != fields:
+            raise RevisionError("unsupported or missing check fields")
+    if seen != expected.keys():
+        raise RevisionError("missing results for registered criteria: " + ", ".join(sorted(expected.keys() - seen)))
+
+
+def validate_record(record, criteria):
+    if not isinstance(record, dict) or set(record) != {"outcome", "checks"}:
+        raise RevisionError("result input requires only outcome and checks; criteria belong in the plan")
+    outcome = record["outcome"]
+    if not isinstance(outcome, str) or outcome not in {"confirmed", "unchanged", "needs_revision", "held"}:
+        raise RevisionError("invalid outcome")
+    validate_checks(record["checks"], criteria)
+    statuses = {check["status"] for check in record["checks"]}
+    if outcome in {"confirmed", "unchanged"} and statuses & {"needs_revision", "held"}:
+        raise RevisionError("unresolved criteria cannot be confirmed or unchanged")
+    if outcome == "needs_revision" and "needs_revision" not in statuses:
+        raise RevisionError("needs_revision requires a criterion that still needs revision")
+    if outcome == "held" and ("held" not in statuses or "needs_revision" in statuses):
+        raise RevisionError("held requires documented held results for all unresolved criteria")
+
+
 def record_review(state, uid, expected, record):
     unit = unit_by_id(state, uid)
     check_token(state, unit, expected)
-    validate_record(record)
+    validate_plan(unit["plan"], criteria_for(state, "unit"))
+    criteria = criteria_for(state, "unit", unit["plan"])
+    validate_record(record, criteria)
     outcome = record["outcome"]
     if unit["attempts"] >= state["max_iterations"] and outcome != "held":
         raise RevisionError("iteration limit reached: only a documented hold may be recorded")
@@ -419,17 +564,21 @@ def record_review(state, uid, expected, record):
     attempts = unit["attempts"] + 1
     if outcome == "needs_revision" and attempts >= state["max_iterations"]:
         outcome = "held"
+    saved = copy.deepcopy(record)
     if outcome == "held":
-        held_details(record)
-    review = copy.deepcopy(record)
-    review.update({"token": expected, "outcome": outcome,
-                   "iteration": attempts, "limit_reached": attempts >= state["max_iterations"]})
+        for check in saved["checks"]:
+            if check["status"] == "needs_revision":
+                held_details(check)
+                check["status"] = "held"
+    saved["outcome"] = outcome
+    validate_record(saved, criteria)
+    review = {"token": expected, "record": saved, "criteria": criteria,
+              "iteration": attempts, "limit_reached": attempts >= state["max_iterations"]}
     unit["attempts"] = attempts
     unit["review"] = review
     unit["history"].append({"action": "review", **copy.deepcopy(review)})
     unit["awaiting_review"] = False
-    unit["state"] = {"needs_revision": "recheck", "held": "held",
-                     "unchanged": "unchanged", "confirmed": "confirmed"}[outcome]
+    unit["state"] = "recheck" if outcome == "needs_revision" else outcome
     state["final_review"] = None
 
 
@@ -517,6 +666,7 @@ def split_unit(state, uid, expected, parts):
         kind = candidates[0]["kind"] if len(candidates) == 1 else "group"
         child = make_unit(state, part, kind, [uid])
         child["notes"] = copy.deepcopy(unit["notes"])
+        child["plan"] = copy.deepcopy(unit["plan"])
         child["context_ids"] = list(dict.fromkeys(unit["context_ids"] + neighbors))
         child["attempts"] = unit["attempts"]
         child["inherited_change"] = unit["inherited_change"] or unit["text"] != unit["initial_text"]
@@ -546,6 +696,20 @@ def merge_units(state, ids):
     text = "".join(u["text"] for u in old)
     new = make_unit(state, text, "group", ids)
     new["notes"]["inherited"] = [copy.deepcopy(u["notes"]) for u in old]
+    new["notes"]["inherited_plans"] = [copy.deepcopy(u["plan"]) for u in old]
+    if all(u["plan"] for u in old):
+        new["plan"] = {
+            name: "\n".join(dict.fromkeys(u["plan"][name] for u in old))
+            for name in ("problem", "evidence", "proposal")}
+        new["plan"]["preservation"] = list(dict.fromkeys(
+            item for u in old for item in u["plan"]["preservation"]))
+        criterion_ids = {c["id"] for c in criteria_for(state, "unit")}
+        if all(set(u["plan"]["criteria"]) == criterion_ids for u in old):
+            new["plan"]["criteria"] = {
+                key: "\n".join(dict.fromkeys(u["plan"]["criteria"][key] for u in old))
+                for key in sorted(criterion_ids)}
+        else:
+            new["plan"] = None
     new["context_ids"] = list(dict.fromkeys(r for u in old for r in u["context_ids"] if r not in ids))
     new["attempts"] = max(u["attempts"] for u in old)
     new["inherited_change"] = any(u["inherited_change"] or u["text"] != u["initial_text"] for u in old)
@@ -577,27 +741,40 @@ def blocking_issues(state):
             issues.append(f"{uid}: missing/current-version review required")
             continue
         try:
-            validate_record(review)
-            if unit["state"] == "held":
-                held_details(review)
+            validate_plan(unit["plan"], criteria_for(state, "unit"))
+            criteria = criteria_for(state, "unit", unit["plan"])
+            validate_record(review["record"], criteria)
+            if review["criteria"] != criteria or review["record"]["outcome"] != unit["state"]:
+                raise RevisionError("record does not match current criteria/state")
         except RevisionError as error:
             issues.append(f"{uid}: {error}")
     return issues
 
 
+def validate_final_record(state, record):
+    if not isinstance(record, dict) or set(record) != {"original_comparison", "standalone_read", "checks"}:
+        raise RevisionError("full-document result must be an object with original_comparison, standalone_read, checks")
+    validate_plan(state["document_plan"], criteria_for(state, "document"))
+    for name in ("original_comparison", "standalone_read"):
+        require_text(record.get(name), name)
+        if record[name].strip().casefold().strip(".。") in OPAQUE:
+            raise RevisionError("describe the full-document check, not a bare OK")
+    criteria = criteria_for(state, "document", state["document_plan"])
+    validate_checks(record["checks"], criteria)
+    if any(check["status"] == "needs_revision" for check in record["checks"]):
+        raise RevisionError("return affected targets to recheck before final completion")
+    return criteria
+
+
 def final_review(state, expected, record):
-    if not isinstance(record, dict):
-        raise RevisionError("full-document review record must be an object")
     if expected != document_token(state):
         raise RevisionError("stale document token")
     issues = blocking_issues(state)
     if issues:
         raise RevisionError("unfinished targets: " + "; ".join(issues))
-    for name in ("original_comparison", "standalone_read"):
-        require_text(record.get(name), name)
-        if record[name].strip().casefold().strip(".。") in OPAQUE:
-            raise RevisionError("describe the full-document check, not a bare OK")
-    state["final_review"] = {**copy.deepcopy(record), "token": expected}
+    criteria = validate_final_record(state, record)
+    state["final_review"] = {"record": copy.deepcopy(record), "token": expected, "criteria": criteria}
+    state["document_history"].append({"action": "review", **copy.deepcopy(state["final_review"])})
 
 
 def finish(state):
@@ -606,9 +783,15 @@ def finish(state):
         raise RevisionError("unfinished targets: " + "; ".join(issues))
     if not state["final_review"] or state["final_review"]["token"] != document_token(state):
         raise RevisionError("current-version full-document review is required")
-    held = [{"id": u["id"], **u["review"]} for u in state["units"] if u["state"] == "held"]
+    full = state["final_review"]
+    if full["criteria"] != validate_final_record(state, full["record"]):
+        raise RevisionError("full-document criteria changed")
+    held = [{"id": u["id"], "plan": u["plan"], **u["review"]} for u in state["units"]
+            if u["state"] == "held"]
+    if any(check["status"] == "held" for check in full["record"]["checks"]):
+        held.append({"id": "document", "plan": state["document_plan"], **full})
     return {"text": render(state), "document_token": document_token(state),
-            "fully_resolved": not held, "held": held, "final_review": state["final_review"]}
+            "brief": state["brief"], "fully_resolved": not held, "held": held, "final_review": full}
 
 
 def parser():
@@ -620,6 +803,9 @@ def parser():
     init.add_argument("--working", type=Path)
     init.add_argument("--brief", required=True, type=Path)
     init.add_argument("--max-iterations", type=int, default=3)
+    migrate = sub.add_parser("upgrade")
+    migrate.add_argument("--brief", required=True, type=Path)
+    migrate.add_argument("--max-iterations", type=int)
     sub.add_parser("next")
     sub.add_parser("status")
     show = sub.add_parser("show")
@@ -627,6 +813,12 @@ def parser():
     pick.add_argument("--unit")
     pick.add_argument("--history")
     pick.add_argument("--document", choices=["original", "initial_working", "working"])
+    plan = sub.add_parser("plan")
+    plan_target = plan.add_mutually_exclusive_group(required=True)
+    plan_target.add_argument("--unit")
+    plan_target.add_argument("--document", action="store_true")
+    plan.add_argument("--token", required=True)
+    plan.add_argument("--file", required=True, type=Path)
     for name in ("edit", "record", "annotate", "split"):
         item = sub.add_parser(name)
         item.add_argument("--unit", required=True)
@@ -665,6 +857,11 @@ def main(argv=None):
             state = initialize(read_text(args.original), read_text(args.working or args.original),
                                read_json(args.brief), args.max_iterations)
             result = status(state)
+        elif args.command == "upgrade":
+            if args.state.is_symlink():
+                raise RevisionError("state must be a regular file, not a symbolic link")
+            state = upgrade(read_json(args.state), read_json(args.brief), args.max_iterations)
+            result = status(state)
         else:
             state = load(args.state)
             command = args.command
@@ -680,6 +877,9 @@ def main(argv=None):
             elif command == "edit":
                 edit(state, args.unit, args.token, read_text(args.file), args.affected, args.all_affected)
                 result = view(state, unit_by_id(state, args.unit))
+            elif command == "plan":
+                set_plan(state, args.unit, args.token, read_json(args.file))
+                result = view(state, unit_by_id(state, args.unit)) if args.unit else status(state)
             elif command == "record":
                 record_review(state, args.unit, args.token, read_json(args.file))
                 result = status(state)
@@ -697,10 +897,7 @@ def main(argv=None):
                 invalidate(state, [u["id"] for u in state["units"]] if args.all else args.units, args.reason)
                 result = status(state)
             elif command == "brief":
-                brief = read_json(args.file)
-                validate_brief(brief)
-                state["brief"] = brief
-                invalidate(state, [u["id"] for u in state["units"]], "document brief changed")
+                update_brief(state, read_json(args.file))
                 result = status(state)
             elif command == "final-review":
                 final_review(state, args.token, read_json(args.file))

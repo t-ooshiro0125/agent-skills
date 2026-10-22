@@ -16,7 +16,13 @@ revision = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(revision)
 
 BRIEF = {"purpose": "手順を正しく選ぶ", "reader": "新任の担当者",
-         "scope": "全文", "allowed_changes": "事実と条件を保った整理"}
+         "reader_difficulties": "対象と適用条件の意味を読み取りにくい",
+         "desired_understanding": "対象と条件を理解し、実行してよい手順を選べる",
+         "scope": "全文", "allowed_changes": "事実と条件を保った整理",
+         "criteria": [
+             {"id": "meaning", "stage": "unit", "description": "意味と条件を保持する"},
+             {"id": "clarity", "stage": "unit", "description": "読者が対象と条件を判断できる"},
+             {"id": "coherence", "stage": "document", "description": "全文の説明がつながる"}]}
 TICKS = chr(96) * 3
 DOCUMENT = (
     "\ufeff# 作業の選択\r\n\r\n"
@@ -31,35 +37,66 @@ DOCUMENT = (
 
 
 def state(text="最初の説明。\n\n次の説明。\n\n最後の説明。\n", limit=3):
-    return revision.initialize(text, text, BRIEF, limit)
+    value = revision.initialize(text, text, BRIEF, limit)
+    for unit in value["units"]:
+        ensure_plan(value, unit)
+    return value
+
+
+def fixture_plan(value, stage="unit"):
+    return {"problem": "依頼の観点で対象を点検する",
+            "evidence": "原文に対象と条件が記載されている",
+            "proposal": "意味を保ち、必要な対象・条件を明示する",
+            "preservation": ["対象と適用条件を維持する"],
+            "criteria": {c["id"]: c["description"] for c in revision.criteria_for(value, stage)}}
+
+
+def ensure_plan(value, unit=None):
+    if unit is not None and unit["plan"] is None:
+        revision.set_plan(value, unit["id"], revision.token(value, unit), fixture_plan(value))
+    elif unit is None and value["document_plan"] is None:
+        revision.set_plan(value, None, revision.document_token(value), fixture_plan(value, "document"))
+
+
+def result_for(value, unit=None, outcome="unchanged"):
+    stage = "unit" if unit is not None else "document"
+    plan = unit["plan"] if unit is not None else value["document_plan"]
+    checks = [{"criterion_id": c["id"], "criterion_version": c["version"],
+               "status": "passed", "observation": "本文に対象と適用条件が残っている"}
+              for c in revision.criteria_for(value, stage, plan)]
+    if outcome in {"held", "needs_revision"}:
+        checks[0]["status"] = outcome
+    if outcome == "held":
+        checks[0].update({"reason": "対象の上限値が原文にない",
+                         "proposal": "上限を確認後、「一日あたり○件」と追記する",
+                         "required_decision": "担当者に上限値の根拠と説明追加の採否を確認する"})
+    return {"outcome": outcome, "checks": checks}
 
 
 def record(outcome="unchanged", **extra):
-    value = {"outcome": outcome, "problem": "この箇所に修正が必要な問題は見つからない",
-             "evidence": "原文と照合し、対象と適用条件がこの段落内で読める",
-             "preservation": ["適用する対象と条件を維持する"],
-             "criteria": ["読者が対象と条件を判断できる"],
-             "checks": [{"criterion": "適用条件の保持",
-                         "observation": "準備ができた場合だけ進むという条件が残っている"}]}
+    dummy = {"brief": BRIEF, "document_plan": None}
+    unit = {"plan": fixture_plan(dummy)}
+    value = result_for(dummy, unit, outcome)
     value.update(extra)
     return value
 
 
 def hold():
-    return record("held", reason="対象の上限値が原文にない",
-                  proposal="上限を確認後、「一日あたり○件」と追記する",
-                  required_decision="担当者に上限値の根拠と説明追加の採否を確認する")
+    return record("held")
 
 
 def accept_all(value):
     for unit in value["units"]:
-        revision.record_review(value, unit["id"], revision.token(value, unit), record())
+        ensure_plan(value, unit)
+        revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit))
 
 
 def final(value):
+    ensure_plan(value)
     revision.final_review(value, revision.document_token(value), {
         "original_comparison": "全文を原文と照合し、数値・条件・リンク・断定を維持した",
-        "standalone_read": "修正文だけを読み、対象の選択から条件と手順へ進めることを確認した"})
+        "standalone_read": "修正文だけを読み、対象の選択から条件と手順へ進めることを確認した",
+        "checks": result_for(value)["checks"]})
 
 
 class SegmentationTests(unittest.TestCase):
@@ -352,7 +389,8 @@ class ReviewTests(unittest.TestCase):
         self.assertIsNone(value["final_review"])
         with self.assertRaises(revision.RevisionError):
             revision.record_review(value, unit["id"], old_token, record("confirmed"))
-        self.assertIn("最初の説明。", unit["history"][1]["text"])
+        self.assertTrue(any(e["action"] == "edit" and "最初の説明。" in e["text"]
+                            for e in unit["history"]))
 
     def test_unchanged_is_not_available_after_edit_and_edit_requires_check(self):
         value = state("元の説明。\n")
@@ -379,9 +417,9 @@ class ReviewTests(unittest.TestCase):
         self.assertTrue(all(u["state"] == "recheck" for u in value["units"]))
 
     def test_bare_ok_or_missing_required_records_are_rejected(self):
-        bad_records = [record(checks=[]), record(preservation=[]), record(criteria=[]),
-                       record(problem=""), {"outcome": "unchanged"},
-                       record(checks=[{"criterion": "条件の保持", "observation": "OK"}])]
+        bare = record()
+        bare["checks"][0]["observation"] = "OK"
+        bad_records = [record(checks=[]), record(criteria=["meaning"]), {"outcome": "unchanged"}, bare]
         for bad in bad_records:
             value = state("説明。\n")
             with self.subTest(bad=bad), self.assertRaises(revision.RevisionError):
@@ -392,7 +430,7 @@ class ReviewTests(unittest.TestCase):
         value = state("説明。\n")
         accept_all(value)
         final(value)
-        value["units"][0]["review"]["checks"] = []
+        value["units"][0]["review"]["record"]["checks"] = []
         with self.assertRaises(revision.RevisionError):
             revision.finish(value)
 
@@ -404,6 +442,7 @@ class ReviewTests(unittest.TestCase):
             revision.record_review(value, unit["id"], revision.token(value, unit), bad)
         held = hold()
         held["outcome"] = "needs_revision"
+        held["checks"][0]["status"] = "needs_revision"
         revision.record_review(value, unit["id"], revision.token(value, unit), held)
         self.assertEqual(unit["state"], "held")
         self.assertTrue(unit["review"]["limit_reached"])
@@ -413,7 +452,8 @@ class ReviewTests(unittest.TestCase):
         final(value)
         result = revision.finish(value)
         self.assertFalse(result["fully_resolved"])
-        self.assertEqual(result["held"][0]["proposal"], held["proposal"])
+        self.assertEqual(result["held"][0]["record"]["checks"][0]["proposal"],
+                         held["checks"][0]["proposal"])
         with self.assertRaises(revision.RevisionError):
             revision.edit(value, unit["id"], revision.token(value, unit), "推測の値。\n\n")
 
@@ -434,7 +474,7 @@ class ReviewTests(unittest.TestCase):
         unit = value["units"][0]
         for key in ("reason", "proposal", "required_decision"):
             bad = hold()
-            del bad[key]
+            del bad["checks"][0][key]
             with self.assertRaises(revision.RevisionError):
                 revision.record_review(value, unit["id"], revision.token(value, unit), bad)
 
@@ -476,7 +516,7 @@ class ReviewTests(unittest.TestCase):
         value = state()
         unit = value["units"][0]
         revision.annotate(value, unit["id"], revision.token(value, unit),
-                          {"findings": ["条件が不明"], "preservation": ["未決定を維持"]})
+                          {"findings": ["条件が不明"]})
         revision.record_review(value, unit["id"], revision.token(value, unit), hold())
         old = copy.deepcopy(unit)
         revision.merge_units(value, [u["id"] for u in value["units"][:2]])
@@ -485,6 +525,254 @@ class ReviewTests(unittest.TestCase):
         records = revision.history(value, value["units"][0]["id"])["records"]
         self.assertIn(old, records)
         self.assertEqual(revision.history(value, old["id"])["records"][0], old)
+
+
+class CriterionWorkflowTests(unittest.TestCase):
+    def test_reader_difficulties_goals_and_registered_criteria_are_presented(self):
+        value = state("確認する対象。\n")
+        shown = revision.next_target(value)
+        brief = shown["reference_only"]["brief"]
+        self.assertEqual(brief["reader_difficulties"], BRIEF["reader_difficulties"])
+        self.assertEqual(brief["desired_understanding"], BRIEF["desired_understanding"])
+        self.assertEqual({c["id"] for c in shown["target"]["required_criteria"]}, {"meaning", "clarity"})
+        self.assertEqual([c["id"] for c in revision.status(value)["document_criteria"]], ["coherence"])
+        for name in ("reader_difficulties", "desired_understanding"):
+            invalid = copy.deepcopy(BRIEF)
+            del invalid[name]
+            with self.assertRaises(revision.RevisionError):
+                revision.initialize("原文", "原文", invalid)
+
+    def test_two_registered_criteria_with_one_result_cannot_complete(self):
+        value = state("確認する対象。\n")
+        unit = value["units"][0]
+        incomplete = record()
+        incomplete["checks"] = incomplete["checks"][:1]
+        before = copy.deepcopy(value)
+        with self.assertRaisesRegex(revision.RevisionError, "missing results.*clarity"):
+            revision.record_review(value, unit["id"], revision.token(value, unit), incomplete)
+        self.assertEqual(value, before)
+        with self.assertRaises(revision.RevisionError):
+            revision.finish(value)
+        incomplete["criteria"] = ["meaning"]
+        with self.assertRaisesRegex(revision.RevisionError, "criteria belong in the plan"):
+            revision.record_review(value, unit["id"], revision.token(value, unit), incomplete)
+        self.assertEqual(len(unit["plan"]["criteria"]), 2)
+
+    def test_changed_registered_definition_rejects_old_results_even_with_new_target_token(self):
+        value = state("対象。\n")
+        unit = value["units"][0]
+        previous = record()
+        revision.record_review(value, unit["id"], revision.token(value, unit), previous)
+        final(value)
+        old_review = copy.deepcopy(unit["review"])
+        brief = copy.deepcopy(value["brief"])
+        brief["criteria"][1]["description"] = "読者が対象と確認事項を本文から読み取れる"
+        revision.update_brief(value, brief)
+        self.assertEqual(unit["state"], "recheck")
+        self.assertIsNone(value["final_review"])
+        with self.assertRaisesRegex(revision.RevisionError, "stale criterion version"):
+            revision.record_review(value, unit["id"], revision.token(value, unit), previous)
+        with self.assertRaises(revision.RevisionError):
+            revision.finish(value)
+        self.assertIn({"action": "review", **old_review}, unit["history"])
+
+    def test_changed_completion_condition_invalidates_the_target_result(self):
+        value = state("対象。\n")
+        unit = value["units"][0]
+        previous = record()
+        revision.record_review(value, unit["id"], revision.token(value, unit), previous)
+        plan = copy.deepcopy(unit["plan"])
+        plan["criteria"]["clarity"] = "何を対象に何を確認するかを一文で読み取れる"
+        revision.set_plan(value, unit["id"], revision.token(value, unit), plan)
+        self.assertEqual(unit["state"], "recheck")
+        self.assertEqual(unit["text"], "対象。\n")
+        with self.assertRaisesRegex(revision.RevisionError, "stale criterion version"):
+            revision.record_review(value, unit["id"], revision.token(value, unit), previous)
+
+    def test_plans_cannot_contain_results_and_do_not_confirm_a_target(self):
+        value = revision.initialize("対象。\n", "対象。\n", BRIEF)
+        unit = value["units"][0]
+        plan = fixture_plan(value)
+        for field, data in (("checks", record()["checks"]), ("outcome", "confirmed"),
+                            ("status", "passed")):
+            invalid = copy.deepcopy(plan)
+            invalid[field] = data
+            with self.assertRaisesRegex(revision.RevisionError, "no results"):
+                revision.set_plan(value, unit["id"], revision.token(value, unit), invalid)
+        nested = copy.deepcopy(plan)
+        nested["criteria"]["clarity"] = {"status": "passed", "observation": "事前の確認結果"}
+        with self.assertRaises(revision.RevisionError):
+            revision.set_plan(value, unit["id"], revision.token(value, unit), nested)
+        revision.set_plan(value, unit["id"], revision.token(value, unit), plan)
+        self.assertEqual(unit["state"], "pending")
+        self.assertIsNone(unit["review"])
+        with self.assertRaises(revision.RevisionError):
+            revision.finish(value)
+
+    def test_confirmation_requires_a_plan_with_all_registered_ids(self):
+        value = revision.initialize("対象。\n", "対象。\n", BRIEF)
+        unit = value["units"][0]
+        with self.assertRaisesRegex(revision.RevisionError, "plan requires"):
+            revision.record_review(value, unit["id"], revision.token(value, unit), record())
+        plan = fixture_plan(value)
+        del plan["criteria"]["clarity"]
+        with self.assertRaisesRegex(revision.RevisionError, "every registered criterion"):
+            revision.set_plan(value, unit["id"], revision.token(value, unit), plan)
+        with self.assertRaises(revision.RevisionError):
+            revision.edit(value, unit["id"], revision.token(value, unit), "修正。\n")
+
+    def test_unapplied_criteria_need_a_reason_and_duplicate_or_unknown_ids_are_rejected(self):
+        value = state("# 見出し\n")
+        unit = value["units"][0]
+        checks = record()
+        checks["checks"][1]["status"] = "not_applicable"
+        with self.assertRaisesRegex(revision.RevisionError, "not_applicable reason"):
+            revision.record_review(value, unit["id"], revision.token(value, unit), checks)
+        checks["checks"][1]["reason"] = "この対象は見出しのみで、別途説明する用語を含まない"
+        revision.record_review(value, unit["id"], revision.token(value, unit), checks)
+        self.assertEqual(unit["review"]["record"]["checks"][1]["status"], "not_applicable")
+        for uid in ("meaning", "unregistered"):
+            invalid = record()
+            invalid["checks"][1]["criterion_id"] = uid
+            with self.assertRaisesRegex(revision.RevisionError, "unknown or duplicate"):
+                revision.record_review(value, unit["id"], revision.token(value, unit), invalid)
+
+    def test_required_criteria_cannot_be_silently_dropped_or_moved(self):
+        value = state("対象。\n")
+        for operation in ("drop", "move"):
+            brief = copy.deepcopy(value["brief"])
+            if operation == "drop":
+                brief["criteria"].pop(1)
+            else:
+                brief["criteria"][1]["stage"] = "document"
+            before = copy.deepcopy(value)
+            with self.assertRaisesRegex(revision.RevisionError, "do not silently drop or move"):
+                revision.update_brief(value, brief)
+            self.assertEqual(value, before)
+
+    def test_reader_goal_changes_invalidate_earlier_checks(self):
+        value = state("対象。\n")
+        accept_all(value)
+        final(value)
+        unit = value["units"][0]
+        old_token = revision.token(value, unit)
+        brief = copy.deepcopy(value["brief"])
+        brief["reader_difficulties"] = "条件は分かるが、専門用語の役割が分からない"
+        revision.update_brief(value, brief)
+        self.assertEqual(unit["state"], "recheck")
+        self.assertIsNone(value["final_review"])
+        with self.assertRaisesRegex(revision.RevisionError, "stale unit token"):
+            revision.record_review(value, unit["id"], old_token, record())
+
+    def test_added_criterion_requires_a_new_plan_and_result(self):
+        value = state("対象。\n")
+        accept_all(value)
+        final(value)
+        unit = value["units"][0]
+        old_result = result_for(value, unit)
+        brief = copy.deepcopy(value["brief"])
+        brief["criteria"].append({"id": "terms", "stage": "unit",
+                                  "description": "必要な用語の意味と役割を理解できる"})
+        revision.update_brief(value, brief)
+        with self.assertRaisesRegex(revision.RevisionError, "every registered criterion"):
+            revision.record_review(value, unit["id"], revision.token(value, unit), old_result)
+        plan = copy.deepcopy(unit["plan"])
+        plan["criteria"]["terms"] = "本文にある用語の対象と意味が分かる"
+        revision.set_plan(value, unit["id"], revision.token(value, unit), plan)
+        with self.assertRaisesRegex(revision.RevisionError, "missing results.*terms"):
+            revision.record_review(value, unit["id"], revision.token(value, unit), old_result)
+        with self.assertRaises(revision.RevisionError):
+            revision.finish(value)
+        revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit))
+        final(value)
+        self.assertTrue(revision.finish(value)["fully_resolved"])
+
+    def test_document_criteria_are_covered_and_versions_are_checked(self):
+        value = state("対象。\n")
+        accept_all(value)
+        ensure_plan(value)
+        old_check = result_for(value)["checks"]
+        plan = copy.deepcopy(value["document_plan"])
+        plan["criteria"]["coherence"] = "原文なしでも選択から手順まで説明を追える"
+        revision.set_plan(value, None, revision.document_token(value), plan)
+        payload = {"original_comparison": "原文の対象と条件を全文照合した",
+                   "standalone_read": "修正文だけを読んで説明の順序を確認した",
+                   "checks": old_check}
+        with self.assertRaisesRegex(revision.RevisionError, "stale criterion version"):
+            revision.final_review(value, revision.document_token(value), payload)
+        payload["checks"] = []
+        with self.assertRaisesRegex(revision.RevisionError, "missing results"):
+            revision.final_review(value, revision.document_token(value), payload)
+        with self.assertRaises(revision.RevisionError):
+            revision.finish(value)
+
+    def test_document_hold_is_not_resolved_and_needs_revision_cannot_finish(self):
+        value = state("対象。\n")
+        accept_all(value)
+        ensure_plan(value)
+        payload = {"original_comparison": "原文の対象と条件を全文照合した",
+                   "standalone_read": "修正文の説明順序には判断待ちが残る",
+                   "checks": result_for(value, outcome="needs_revision")["checks"]}
+        with self.assertRaisesRegex(revision.RevisionError, "return affected targets"):
+            revision.final_review(value, revision.document_token(value), payload)
+        check = payload["checks"][0]
+        check.update({"status": "held", "reason": "説明順序に方針判断が必要",
+                      "proposal": "利用者の選択を冒頭に置く案を採用する",
+                      "required_decision": "文書の所有者が先に説明する内容を決める"})
+        revision.final_review(value, revision.document_token(value), payload)
+        result = revision.finish(value)
+        self.assertFalse(result["fully_resolved"])
+        self.assertEqual(result["held"][0]["id"], "document")
+
+    def test_results_are_not_derived_from_changed_text_or_plan(self):
+        value = state("対象。\n")
+        unit = value["units"][0]
+        revision.edit(value, unit["id"], revision.token(value, unit), "明示した対象。\n")
+        self.assertIsNone(unit["review"])
+        self.assertEqual(unit["state"], "recheck")
+        wrong = record("confirmed")
+        wrong["checks"][1]["status"] = "needs_revision"
+        with self.assertRaisesRegex(revision.RevisionError, "unresolved criteria"):
+            revision.record_review(value, unit["id"], revision.token(value, unit), wrong)
+        with self.assertRaises(revision.RevisionError):
+            revision.finish(value)
+
+    def test_same_observation_can_be_recorded_after_a_new_context_is_checked(self):
+        value = state("対象。\n\n隣の説明。\n")
+        first, second = value["units"]
+        payload = record()
+        revision.record_review(value, first["id"], revision.token(value, first), payload)
+        old = revision.token(value, first)
+        revision.edit(value, second["id"], revision.token(value, second), "隣の説明を明確にした。\n")
+        self.assertNotEqual(old, revision.token(value, first))
+        revision.record_review(value, first["id"], revision.token(value, first), payload)
+        self.assertEqual(first["state"], "unchanged")
+        self.assertEqual(first["review"]["record"], payload)
+
+    def test_upgrade_retains_original_ids_history_and_attempts_but_requires_new_checks(self):
+        value = state("対象。\n")
+        unit = value["units"][0]
+        legacy = copy.deepcopy(value)
+        legacy["format"] = 1
+        legacy["brief"] = {key: BRIEF[key] for key in ("purpose", "reader", "scope", "allowed_changes")}
+        previous = {"token": "legacy", "outcome": "unchanged", "checks": [{"observation": "過去の確認"}]}
+        legacy["units"][0].update({"review": previous, "attempts": 2, "state": "unchanged"})
+        del legacy["units"][0]["plan"]
+        legacy["final_review"] = {"token": "legacy-document", "original_comparison": "過去の照合"}
+        upgraded = revision.upgrade(legacy, BRIEF)
+        current = upgraded["units"][0]
+        self.assertEqual(upgraded["original"], legacy["original"])
+        self.assertEqual(revision.render(upgraded), revision.render(legacy))
+        self.assertEqual(current["id"], unit["id"])
+        self.assertEqual(current["attempts"], 2)
+        self.assertEqual(current["state"], "recheck")
+        self.assertIsNone(current["plan"])
+        self.assertIsNone(current["review"])
+        self.assertIn({"action": "legacy_review", "review": previous}, current["history"])
+        self.assertIsNone(upgraded["final_review"])
+        with self.assertRaises(revision.RevisionError):
+            revision.finish(upgraded)
+        self.assertEqual(legacy["format"], 1)
 
 
 class CliTests(unittest.TestCase):
@@ -538,6 +826,80 @@ class CliTests(unittest.TestCase):
         self.cli("finish", "--output", output, "--report", report)
         self.assertEqual(output.read_bytes(), self.original.read_bytes())
         self.assertTrue(json.loads(report.read_text())["fully_resolved"])
+
+    def test_cli_separate_plan_and_results_enforce_coverage_before_export(self):
+        self.original.write_text("対象と条件の説明。\n")
+        self.cli("init", "--original", self.original, "--brief", self.brief)
+        target = json.loads(self.cli("next").stdout)["target"]
+        plan_file = self.root / "plan.json"
+        plan = fixture_plan(revision.load(self.path))
+        plan_file.write_text(json.dumps({**plan, "outcome": "confirmed"}))
+        before = self.path.read_bytes()
+        self.cli("plan", "--unit", target["id"], "--token", target["token"],
+                 "--file", plan_file, success=False)
+        self.assertEqual(self.path.read_bytes(), before)
+        plan_file.write_text(json.dumps(plan))
+        target = json.loads(self.cli("plan", "--unit", target["id"], "--token", target["token"],
+                                     "--file", plan_file).stdout)["target"]
+        self.assertEqual(target["state"], "pending")
+        self.assertIsNone(revision.load(self.path)["units"][0]["review"])
+        output = self.root / "output.md"
+        self.cli("finish", "--output", output, success=False)
+        result_file = self.root / "result.json"
+        payload = record()
+        result_file.write_text(json.dumps({**payload, "checks": payload["checks"][:1]}))
+        before = self.path.read_bytes()
+        self.cli("record", "--unit", target["id"], "--token", target["token"],
+                 "--file", result_file, success=False)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.cli("finish", "--output", output, success=False)
+        self.assertFalse(output.exists())
+        result_file.write_text(json.dumps(payload))
+        current = json.loads(self.cli("record", "--unit", target["id"], "--token", target["token"],
+                                      "--file", result_file).stdout)
+        plan_file.write_text(json.dumps(fixture_plan(revision.load(self.path), "document")))
+        current = json.loads(self.cli("plan", "--document", "--token", current["document_token"],
+                                      "--file", plan_file).stdout)
+        value = revision.load(self.path)
+        result_file.write_text(json.dumps({
+            "original_comparison": "全文の対象・条件と元の説明を照合した",
+            "standalone_read": "本文から対象と条件の関係を理解できる",
+            "checks": result_for(value)["checks"]}))
+        self.cli("final-review", "--token", current["document_token"], "--file", result_file)
+        report = self.root / "report.json"
+        self.cli("finish", "--output", output, "--report", report)
+        self.assertEqual(output.read_bytes(), self.original.read_bytes())
+        self.assertTrue(json.loads(report.read_text())["fully_resolved"])
+
+    def test_cli_upgrade_preserves_legacy_history_and_rejects_old_completion(self):
+        legacy = state("対象。\n")
+        accept_all(legacy)
+        final(legacy)
+        legacy["format"] = 1
+        legacy["brief"] = {key: BRIEF[key] for key in ("purpose", "reader", "scope", "allowed_changes")}
+        del legacy["document_plan"], legacy["document_history"]
+        for unit in legacy["units"]:
+            del unit["plan"]
+        self.path.write_text(json.dumps(legacy))
+        before = self.path.read_bytes()
+        self.cli("status", success=False)
+        self.cli("upgrade", "--brief", self.brief, "--max-iterations", 1, success=False)
+        self.assertEqual(self.path.read_bytes(), before)
+        current = json.loads(self.cli("upgrade", "--brief", self.brief,
+                                      "--max-iterations", 6).stdout)
+        upgraded = revision.load(self.path)
+        self.assertEqual(current["counts"], {"recheck": 1})
+        self.assertEqual(upgraded["max_iterations"], 6)
+        unit = upgraded["units"][0]
+        self.assertEqual(unit["id"], legacy["units"][0]["id"])
+        self.assertEqual(unit["attempts"], legacy["units"][0]["attempts"])
+        self.assertEqual(unit["history"][:-1], legacy["units"][0]["history"])
+        self.assertEqual(upgraded["document_history"][0]["review"], legacy["final_review"])
+        self.assertIsNone(unit["review"])
+        self.assertIsNone(upgraded["final_review"])
+        output = self.root / "output.md"
+        self.cli("finish", "--output", output, success=False)
+        self.assertFalse(output.exists())
 
     def test_final_review_rejects_non_object_json_without_changing_state(self):
         self.cli("init", "--original", self.original, "--brief", self.brief)
