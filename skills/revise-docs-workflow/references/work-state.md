@@ -53,7 +53,7 @@ python3 revision.py --state work.json split --unit u0004 --token TOKEN --file pa
 python3 revision.py --state work.json reorder --units u0001 u0005 u0006
 ```
 
-`parts.json` は分割後の文字列の配列で、連結すると現行本文に完全一致する必要がある。`reorder` には現存する全 ID を重複なく指定する。引用内でも構造を保ち、切断位置は引用行の先頭にする。表の行には列名を含む先頭部分と前後の参照を継承するが、共通条件や離れた関連箇所が十分かは担当者が確かめる。
+`parts.json` は分割後の文字列の配列で、連結すると現行本文に完全一致する必要がある。`reorder` には現存する全 ID を重複なく指定する。分割した表は列名と行の順序・連続を保ってまとめて移動し、部分ごとの移動が必要なら先に表全体へ結合する。引用内でも構造を保ち、切断位置は引用行の先頭にする。表の行には列名を含む先頭部分と前後の参照を継承するが、共通条件や離れた関連箇所が十分かは担当者が確かめる。
 
 分割・結合は旧対象と履歴を残し、確認済みを新しい対象へ引き継がない。計画の条件も継承・統合し、現在の対象に合わなければ計画を更新する。構成変更後は全対象を再確認する。登録した表現の ID・引用と位置・結果履歴も残し、置換後の全対象へ対応付け直す。詳細は[表現ごとの確認](expression-checks.md)を参照する。
 
@@ -102,7 +102,7 @@ python3 revision.py --state work.json edit --unit u0004 --token TOKEN --file tar
 python3 revision.py --state work.json show --unit u0004
 ```
 
-現行本文と参照文脈を実際に点検し、先に[表現ごとの確認結果](expression-checks.md)を保存してから、別の `result.json` を作る。結果入力は `outcome` と `checks` だけで、基準の定義・省略・差し替えはできない。点検時に取得した `token` と、同じ対象の `required_criteria` に示された基準の版を、それぞれ CLI の `--token` と各 `criterion_version` に使う。保存直前に最新の版を取り直して古い結果へ自動で付け直さない。版が変わったら対象と文脈を取得し直して点検する。本文・文脈・計画の版は `token` に、基準の定義・完了条件の版は `criterion_version` に結び付く。
+現行本文と参照文脈を実際に点検し、先に[表現ごとの確認結果](expression-checks.md)を保存する。表現結果の保存でもまとまりの token は変わるため、全表現の保存後に `show --unit` でまとまりを取得し直し、表現結果も含めて点検してから別の `result.json` を作る。結果入力は `outcome` と `checks` だけで、基準の定義・省略・差し替えはできない。点検時に取得した `token` と、同じ対象の `required_criteria` に示された基準の版を、それぞれ CLI の `--token` と各 `criterion_version` に使う。保存直前に最新の版を取り直して古い結果へ自動で付け直さない。版が変わったら対象と文脈を取得し直して点検する。本文・文脈・計画・表現結果の版は `token` に、基準の定義・完了条件の版は `criterion_version` に結び付く。
 
 ```json
 {

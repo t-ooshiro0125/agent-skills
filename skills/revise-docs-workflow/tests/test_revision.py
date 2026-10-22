@@ -362,6 +362,37 @@ class SegmentationTests(unittest.TestCase):
         self.assertTrue(all(u["state"] == "recheck" for u in value["units"]))
         self.assertIsNone(value["final_review"])
 
+    def test_reorder_keeps_split_table_headers_and_rows_together(self):
+        for prefix in ("", "> "):
+            with self.subTest(prefix=prefix):
+                header = prefix + "| A | B |\n" + prefix + "| --- | --- |\n"
+                row_a, row_b = prefix + "| x | 1 |\n", prefix + "| y | 2 |\n"
+                value = state("前の段落。\n\n" + header + row_a + row_b + "\n後の段落。\n")
+                table = value["units"][1]
+                ids = revision.split_unit(value, table["id"], revision.token(value, table),
+                                          [header, row_a, row_b + "\n"])
+                before_id, after_id = value["units"][0]["id"], value["units"][-1]["id"]
+                for order in ([before_id, ids[0], after_id, ids[1], ids[2]],
+                              [before_id, ids[1], ids[0], ids[2], after_id],
+                              [before_id, ids[0], ids[2], ids[1], after_id]):
+                    before = copy.deepcopy(value)
+                    with self.assertRaisesRegex(revision.RevisionError, "table headers and rows"):
+                        revision.reorder(value, order)
+                    self.assertEqual(value, before)
+                revision.reorder(value, [*ids, before_id, after_id])
+                self.assertEqual(sum(n.type == "table_open" for n in revision.syntax(revision.render(value))), 1)
+                self.assertEqual([u["id"] for u in value["units"]][:3], ids)
+
+    def test_reorder_cannot_attach_rows_to_another_table_header(self):
+        value = state("| A |\n| --- |\n| x |\n\n別の表。\n\n| B |\n| --- |\n| y |\n")
+        first, between, second = value["units"]
+        ids = revision.split_unit(value, first["id"], revision.token(value, first),
+                                  ["| A |\n| --- |\n", "| x |\n\n"])
+        before = copy.deepcopy(value)
+        with self.assertRaisesRegex(revision.RevisionError, "table headers and rows"):
+            revision.reorder(value, [ids[0], between["id"], second["id"], ids[1]])
+        self.assertEqual(value, before)
+
 
 class ReviewTests(unittest.TestCase):
     def test_pending_and_recheck_cannot_finish(self):
@@ -1230,13 +1261,38 @@ class ExpressionTrackingTests(unittest.TestCase):
         old_token = revision.token(value, unit)
         self.check(value, expression, self.explanation(value, outcome="needs_revision",
                                                      observation="Aを何に使うかは本文から分からない"))
-        self.assertEqual(revision.token(value, unit), old_token)
+        self.assertNotEqual(revision.token(value, unit), old_token)
         self.assertEqual(unit["state"], "recheck")
         with self.assertRaises(revision.RevisionError):
             revision.finish(value)
         with self.assertRaises(revision.RevisionError):
             revision.record_review(value, unit["id"], old_token, result_for(value, unit))
         self.assertIsNone(value["final_review"])
+
+    def test_successful_expression_results_reject_prepared_unit_checks(self):
+        for outcome in ("explained", "unchanged"):
+            for existing_result in (False, True):
+                with self.subTest(outcome=outcome, existing_result=existing_result):
+                    value = state("用語A。\n", limit=5)
+                    unit = value["units"][0]
+                    expression = self.register(value)
+                    if existing_result:
+                        self.check(value, expression)
+                        accept_all(value)
+                        final(value)
+                    old_token = revision.token(value, unit)
+                    prepared = result_for(value, unit)
+                    result = self.explanation(value, outcome=outcome)
+                    if outcome == "unchanged":
+                        result["reason"] = "必要な意味が本文で既に説明されている"
+                    self.check(value, expression, result)
+                    with self.assertRaisesRegex(revision.RevisionError, "stale unit token"):
+                        revision.record_review(value, unit["id"], old_token, prepared)
+                    shown = revision.view(value, unit)
+                    self.assertTrue(shown["required_expressions"][0]["review_current"])
+                    revision.record_review(value, unit["id"], shown["target"]["token"], result_for(value, unit))
+                    final(value)
+                    self.assertTrue(revision.finish(value)["fully_resolved"])
 
     def test_unchanged_requires_a_reason_and_held_requires_actionable_details(self):
         value = state("用語A。\n")

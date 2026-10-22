@@ -309,7 +309,7 @@ def expression_by_id(state, eid):
 
 def expression_version(state, expression):
     return digest({"definition": expression_definition(expression),
-                   "owners": [token(state, unit_by_id(state, uid)) for uid in expression["owners"]]})
+                   "owners": [content_token(state, unit_by_id(state, uid)) for uid in expression["owners"]]})
 
 
 def expression_has_hold(expression):
@@ -327,7 +327,7 @@ def expression_fingerprints(state, unit):
     return {e["id"]: digest(e["review"]) for e in expressions_for(state, unit)}
 
 
-def validate_expression_record(state, record):
+def validate_expression_record(state, record, *, stored=False):
     fields = {"outcome", "observation", "evidence"}
     if not isinstance(record, dict) or not fields <= record.keys():
         raise RevisionError("expression result requires outcome, observation, and current-text evidence")
@@ -355,9 +355,13 @@ def validate_expression_record(state, record):
         if not isinstance(item, dict) or set(item) - {"start"} != {"unit_id", "token", "quote"}:
             raise RevisionError("evidence requires unit_id, token, quote, and optional start")
         unit = unit_by_id(state, item["unit_id"])
-        check_token(state, unit, item["token"])
+        if stored:
+            if item["token"] != content_token(state, unit):
+                raise RevisionError("stale expression evidence; retrieve the text and context again")
+        else:
+            check_token(state, unit, item["token"])
         start = quote_position(unit["text"], item["quote"], item.get("start"))
-        normalized["evidence"].append({**item, "start": start})
+        normalized["evidence"].append({**item, "token": content_token(state, unit), "start": start})
     return normalized
 
 
@@ -366,7 +370,7 @@ def expression_review_current(state, expression):
     if not review or review["version"] != expression_version(state, expression):
         return False
     try:
-        validate_expression_record(state, review["record"])
+        validate_expression_record(state, review["record"], stored=True)
     except RevisionError:
         return False
     return True
@@ -392,6 +396,9 @@ def record_expression(state, eid, expected, record):
     expression["history"].append({"action": "review", **copy.deepcopy(expression["review"])})
     expression["hold_active"] = normalized["outcome"] == "held"
     expression["hold_released_version"] = None
+    for uid in expression["owners"]:
+        unit = unit_by_id(state, uid)
+        unit["expression_review_revision"] = unit.get("expression_review_revision", 0) + 1
     state["final_review"] = None
     refresh(state)
 
@@ -498,9 +505,18 @@ def context(state, unit):
     return result
 
 
-def token(state, unit):
+def content_token(state, unit):
     return digest({"id": unit["id"], "text": unit["text"], "generation": unit["generation"],
                    "context": context(state, unit), "plan": unit["plan"]})
+
+
+def token(state, unit):
+    content = content_token(state, unit)
+    # Keep legacy tokens valid until an expression result is saved. Expression
+    # evidence depends on content, while aggregate reviews also depend on results.
+    if unit.get("expression_review_revision", 0):
+        return digest({"content": content, "expression_review_revision": unit["expression_review_revision"]})
+    return content
 
 
 def refresh(state):
@@ -989,6 +1005,22 @@ def reorder(state, ids):
         raise RevisionError("reorder must contain every active identifier exactly once")
     if ids == current:
         return
+    lines = source_lines(render(state))
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    ranges, offset = [], 0
+    for unit in state["units"]:
+        ranges.append((unit["id"], offset, offset + len(unit["text"])))
+        offset += len(unit["text"])
+    positions = {uid: index for index, uid in enumerate(ids)}
+    for node in syntax(render(state)):
+        if node.type != "table_open":
+            continue
+        start, end = (offsets[line] for line in node.map)
+        members = [positions[uid] for uid, first, last in ranges if first < end and start < last]
+        if members != list(range(members[0], members[0] + len(members))):
+            raise RevisionError("keep split table headers and rows together in order; merge the table before reordering its parts")
     state["units"] = [unit_by_id(state, uid) for uid in ids]
     for unit in state["units"]:
         unit["generation"] += 1
