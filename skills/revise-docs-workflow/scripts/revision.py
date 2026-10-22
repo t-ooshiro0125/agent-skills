@@ -9,9 +9,9 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import sys
-import tempfile
 
 
 try:
@@ -54,7 +54,7 @@ def read_json(path):
     return json.loads(read_text(path))
 
 
-def stage_file(path, data):
+def stage_file(path, data, *, new_mode=0o600):
     path = Path(path)
     if path.is_symlink():
         raise RevisionError("refusing to replace a symbolic link; specify the intended regular file")
@@ -64,8 +64,10 @@ def stage_file(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     name = None
     try:
-        with tempfile.NamedTemporaryFile("wb", dir=path.parent, delete=False) as stream:
-            name = stream.name
+        candidate = path.parent / f".revision-{secrets.token_hex(16)}.tmp"
+        descriptor = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, new_mode)
+        name = str(candidate)
+        with os.fdopen(descriptor, "wb") as stream:
             stream.write(data)
             stream.flush()
             if mode is not None:
@@ -77,13 +79,13 @@ def stage_file(path, data):
         raise
 
 
-def write_many_atomic(outputs):
+def write_many_atomic(outputs, *, new_mode=0o600):
     """Stage every output first and restore committed files on replacement errors."""
     staged, backups, committed, recovery = [], {}, [], set()
     try:
         for path, text in outputs:
             path = Path(path)
-            staged.append((path, stage_file(path, text.encode("utf-8"))))
+            staged.append((path, stage_file(path, text.encode("utf-8"), new_mode=new_mode)))
         if len(staged) > 1:
             for path, _ in staged:
                 backups[path] = stage_file(path, path.read_bytes()) if path.exists() else None
@@ -260,6 +262,7 @@ def make_unit(state, text, kind, parents=()):
     return {"id": uid, "kind": kind, "initial_text": text, "text": text,
             "inherited_change": False,
             "generation": 0, "state": "pending", "attempts": 0, "awaiting_review": False,
+            "hold_active": False,
             "notes": {}, "context_ids": [], "history": [], "review": None, "plan": None,
             "parents": list(parents)}
 
@@ -296,6 +299,7 @@ def upgrade(state, brief, max_iterations=None):
                              "previous_max_iterations": state["max_iterations"],
                              "max_iterations": limit})
     for unit in result["units"]:
+        unit["hold_active"] = unit["state"] == "held"
         unit["history"].append({"action": "legacy_review", "review": copy.deepcopy(unit["review"])})
         unit["plan"], unit["review"], unit["state"] = None, None, "recheck"
         unit["generation"] += 1
@@ -397,6 +401,13 @@ def check_token(state, unit, expected):
         raise RevisionError("stale unit token: retrieve the target and its context again")
 
 
+def has_active_hold(unit):
+    review = unit.get("review")
+    previous_hold = (isinstance(review, dict) and isinstance(review.get("record"), dict)
+                     and review["record"].get("outcome") == "held")
+    return unit["state"] == "held" or unit.get("hold_active", previous_hold)
+
+
 def view(state, unit):
     original = unit["notes"].get("original_lines")
     if original:
@@ -410,7 +421,8 @@ def view(state, unit):
     return {"target": {"id": unit["id"], "kind": unit["kind"], "token": token(state, unit),
                        "text": unit["text"], "initial_working_text": unit["initial_text"],
                        "original_text": original_text, "original_scope": original_scope,
-                       "state": unit["state"], "attempts": unit["attempts"],
+                       "state": unit["state"], "hold_active": has_active_hold(unit),
+                       "attempts": unit["attempts"],
                        "max_iterations": state["max_iterations"], "plan": unit["plan"],
                        "required_criteria": criteria_for(state, "unit", unit["plan"])},
             "reference_only": context(state, unit), "previous_review": unit["review"]}
@@ -441,6 +453,7 @@ def status(state):
             "document_criteria": criteria_for(state, "document", state["document_plan"]),
             "counts": dict(Counter(u["state"] for u in state["units"])),
             "units": [{"id": u["id"], "kind": u["kind"], "state": u["state"],
+                       "hold_active": has_active_hold(u),
                        "token": token(state, u), "attempts": u["attempts"]} for u in state["units"]],
             "final_review_current": bool(state["final_review"] and
                                          state["final_review"]["token"] == document_token(state))}
@@ -481,6 +494,7 @@ def invalidate(state, ids, reason):
     for unit in targets:
         unit["generation"] += 1
         unit["state"] = "recheck"
+        unit["hold_active"] = False
     touch(state, reason)
 
 
@@ -490,7 +504,7 @@ def edit(state, uid, expected, text, affected=(), all_affected=False):
     if text == unit["text"]:
         return
     validate_plan(unit["plan"], criteria_for(state, "unit"))
-    if unit["state"] == "held":
+    if has_active_hold(unit):
         raise RevisionError("held unit: invalidate with the new information/decision before editing")
     if unit["attempts"] >= state["max_iterations"]:
         raise RevisionError("iteration limit reached: record a held result with remaining issue and proposal")
@@ -565,6 +579,8 @@ def validate_record(record, criteria):
 def record_review(state, uid, expected, record):
     unit = unit_by_id(state, uid)
     check_token(state, unit, expected)
+    if has_active_hold(unit):
+        raise RevisionError("held unit: invalidate with the new information/decision before recording")
     validate_plan(unit["plan"], criteria_for(state, "unit"))
     criteria = criteria_for(state, "unit", unit["plan"])
     validate_record(record, criteria)
@@ -590,6 +606,7 @@ def record_review(state, uid, expected, record):
     unit["review"] = review
     unit["history"].append({"action": "review", **copy.deepcopy(review)})
     unit["awaiting_review"] = False
+    unit["hold_active"] = outcome == "held"
     unit["state"] = "recheck" if outcome == "needs_revision" else outcome
     state["final_review"] = None
 
@@ -640,7 +657,7 @@ def safe_cuts(text, cuts, kind):
 
 def check_regroupable(units):
     for unit in units:
-        if unit["state"] == "held":
+        if has_active_hold(unit):
             raise RevisionError("held unit: invalidate with the new information/decision before regrouping")
         if unit["awaiting_review"]:
             raise RevisionError("record the check of the last edit before regrouping")
@@ -940,7 +957,7 @@ def main(argv=None):
                 outputs = [(args.output, result.pop("text"))]
                 if args.report:
                     outputs.append((args.report, json.dumps(result, ensure_ascii=False, indent=2) + "\n"))
-                write_many_atomic(outputs)
+                write_many_atomic(outputs, new_mode=0o666)
             else:
                 raise RevisionError("unsupported command")
         if args.command != "finish":

@@ -478,6 +478,70 @@ class ReviewTests(unittest.TestCase):
             with self.assertRaises(revision.RevisionError):
                 revision.record_review(value, unit["id"], revision.token(value, unit), bad)
 
+    def test_hold_cannot_be_overwritten_until_explicit_invalidation(self):
+        value = state("対象。\n")
+        unit = value["units"][0]
+        revision.record_review(value, unit["id"], revision.token(value, unit), hold())
+        final(value)
+        previous = copy.deepcopy(value)
+        for outcome in ("confirmed", "unchanged", "needs_revision", "held"):
+            with self.subTest(outcome=outcome), self.assertRaisesRegex(revision.RevisionError, "held.*invalidate"):
+                revision.record_review(value, unit["id"], revision.token(value, unit),
+                                       result_for(value, unit, outcome))
+            self.assertEqual(value, previous)
+            self.assertFalse(revision.finish(value)["fully_resolved"])
+        revision.invalidate(value, [unit["id"]], "不足していた情報と判断を得た")
+        revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit))
+        self.assertIn(previous["units"][0]["history"][-1], unit["history"])
+        final(value)
+        self.assertTrue(revision.finish(value)["fully_resolved"])
+
+    def test_context_changes_do_not_clear_the_hold_barrier(self):
+        value = state("前の説明。\n\n後の説明。\n\n隣の説明。\n")
+        uid = revision.merge_units(value, [u["id"] for u in value["units"][:2]])
+        unit, neighbor = value["units"]
+        revision.record_review(value, uid, revision.token(value, unit), result_for(value, unit, "held"))
+        revision.edit(value, neighbor["id"], revision.token(value, neighbor), "隣の説明を明確にした。\n")
+        self.assertEqual(unit["state"], "recheck")
+        self.assertTrue(revision.view(value, unit)["target"]["hold_active"])
+        before = copy.deepcopy(value)
+        operations = [
+            lambda: revision.record_review(value, uid, revision.token(value, unit), result_for(value, unit)),
+            lambda: revision.edit(value, uid, revision.token(value, unit), "さらに変更。\n"),
+            lambda: revision.split_unit(value, uid, revision.token(value, unit),
+                                        ["前の説明。\n\n", "後の説明。\n\n"]),
+            lambda: revision.merge_units(value, [u["id"] for u in value["units"]])]
+        for operation in operations:
+            with self.assertRaisesRegex(revision.RevisionError, "held.*invalidate"):
+                operation()
+            self.assertEqual(value, before)
+        revision.invalidate(value, [uid], "文脈の変更を踏まえ保留事項を再確認する")
+        self.assertFalse(revision.view(value, unit)["target"]["hold_active"])
+        revision.record_review(value, uid, revision.token(value, unit), result_for(value, unit))
+        revision.record_review(value, neighbor["id"], revision.token(value, neighbor),
+                               result_for(value, neighbor, "confirmed"))
+        final(value)
+        self.assertTrue(revision.finish(value)["fully_resolved"])
+
+    def test_legacy_states_retain_holds_until_explicit_invalidation(self):
+        for legacy_format in (1, 2):
+            with self.subTest(legacy_format=legacy_format):
+                value = state("対象。\n")
+                unit = value["units"][0]
+                revision.record_review(value, unit["id"], revision.token(value, unit), hold())
+                del unit["hold_active"]
+                if legacy_format == 1:
+                    value["format"] = 1
+                    value = revision.upgrade(value, BRIEF)
+                    unit = value["units"][0]
+                    ensure_plan(value, unit)
+                self.assertTrue(revision.has_active_hold(unit))
+                with self.assertRaisesRegex(revision.RevisionError, "held.*invalidate"):
+                    revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit))
+                revision.invalidate(value, [unit["id"]], "保留事項の判断が得られた")
+                revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit))
+                self.assertFalse(revision.has_active_hold(unit))
+
     def test_regrouping_does_not_turn_edited_text_into_unchanged(self):
         value = state()
         unit = value["units"][0]
@@ -882,11 +946,36 @@ class CliTests(unittest.TestCase):
         self.brief = self.root / "brief.json"
         self.brief.write_text(json.dumps(BRIEF), encoding="utf-8")
 
-    def cli(self, *args, success=True):
+    def cli(self, *args, success=True, umask=-1):
         result = subprocess.run([sys.executable, str(SCRIPT), "--state", str(self.path),
-                                 *map(str, args)], capture_output=True, text=True)
+                                 *map(str, args)], capture_output=True, text=True, umask=umask)
         self.assertEqual(result.returncode, 0 if success else 1, result.stderr)
         return result
+
+    def test_cli_hold_requires_invalidation_before_a_new_result(self):
+        value = state("対象。\n")
+        unit = value["units"][0]
+        revision.record_review(value, unit["id"], revision.token(value, unit), hold())
+        final(value)
+        revision.save(self.path, value)
+        before = self.path.read_bytes()
+        result_file = self.root / "result.json"
+        result_file.write_text(json.dumps(result_for(value, unit)))
+        self.cli("record", "--unit", unit["id"], "--token", revision.token(value, unit),
+                 "--file", result_file, success=False)
+        self.assertEqual(self.path.read_bytes(), before)
+        output, report = self.root / "output.md", self.root / "report.json"
+        self.cli("finish", "--output", output, "--report", report)
+        self.assertFalse(json.loads(report.read_text())["fully_resolved"])
+        self.cli("invalidate", "--units", unit["id"], "--reason", "根拠となる情報と判断を得た")
+        shown = json.loads(self.cli("show", "--unit", unit["id"]).stdout)["target"]
+        self.assertFalse(shown["hold_active"])
+        self.cli("record", "--unit", unit["id"], "--token", shown["token"], "--file", result_file)
+        value = revision.load(self.path)
+        final(value)
+        revision.save(self.path, value)
+        self.cli("finish", "--output", output, "--report", report)
+        self.assertTrue(json.loads(report.read_text())["fully_resolved"])
 
     def test_regrouping_blocks_held_and_unchecked_edits_without_rewriting_state(self):
         for operation in ("split", "merge"):
@@ -1118,6 +1207,38 @@ class CliTests(unittest.TestCase):
         self.cli("finish", "--output", output)
         self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o644)
         self.assertEqual(output.read_bytes(), self.original.read_bytes())
+
+    def test_new_output_and_report_modes_follow_umask_and_state_stays_private(self):
+        self.cli("init", "--original", self.original, "--brief", self.brief, umask=0o022)
+        self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
+        value = revision.load(self.path)
+        accept_all(value)
+        final(value)
+        revision.save(self.path, value)
+        for mask in (0o022, 0o027, 0o077):
+            output, report = self.root / f"output-{mask}.md", self.root / f"report-{mask}.json"
+            with self.subTest(umask=mask):
+                self.cli("finish", "--output", output, "--report", report, umask=mask)
+                for path in (output, report):
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o666 & ~mask)
+                self.assertEqual(output.read_bytes(), self.original.read_bytes())
+        output, report = self.root / "existing.md", self.root / "existing.json"
+        output.write_text("既存の本文")
+        report.write_text("既存のレポート")
+        output.chmod(0o644)
+        report.chmod(0o640)
+        self.cli("finish", "--output", output, "--report", report, umask=0o077)
+        self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o644)
+        self.assertEqual(stat.S_IMODE(report.stat().st_mode), 0o640)
+
+    def test_temporary_name_collision_does_not_remove_the_existing_file(self):
+        existing = self.root / ".revision-collision.tmp"
+        existing.write_text("別の処理のファイル")
+        with patch.object(revision.secrets, "token_hex", return_value="collision"):
+            with self.assertRaises(FileExistsError):
+                revision.stage_file(self.root / "output.md", b"new output")
+        self.assertEqual(existing.read_text(), "別の処理のファイル")
+        self.assertFalse((self.root / "output.md").exists())
 
     def test_finish_rejects_symlinks_without_replacing_link_or_other_outputs(self):
         self.cli("init", "--original", self.original, "--brief", self.brief)
