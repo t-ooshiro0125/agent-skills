@@ -635,10 +635,15 @@ def document_token(state):
                    "units": [token(state, u) for u in state["units"]]})
 
 
-def touch(state, reason):
+def touch(state, reason, *, previous_contexts=None):
     state["revision"] += 1
     state["final_review"] = None
     state["events"].append({"revision": state["revision"], "reason": reason})
+    if previous_contexts:
+        for unit in state["units"]:
+            previous = previous_contexts.get(unit["id"])
+            if previous is not None and previous != digest(context(state, unit)):
+                unit["generation"] += 1
     refresh(state)
 
 
@@ -808,15 +813,18 @@ def edit(state, uid, expected, text, affected=(), all_affected=False):
     proposed = [{**u, "text": text} if u is unit else u for u in state["units"]]
     if split_structure_shapes(state["units"]) != split_structure_shapes(proposed):
         raise RevisionError("preserve split table/list structure; merge the whole structure before changing it")
+    if all_affected:
+        impacted = state["units"]
+    changed_ids = {uid, *(other["id"] for other in impacted)}
+    previous_contexts = {other["id"]: digest(context(state, other)) for other in state["units"]
+                         if other["id"] not in changed_ids}
     unit["history"].append({"action": "edit", "text": unit["text"], "token": expected})
     unit["text"], unit["state"], unit["awaiting_review"] = text, "recheck", True
     unit["generation"] += 1
-    if all_affected:
-        impacted = state["units"]
     for other in impacted:
         if other is not unit:
             other["generation"] += 1
-    touch(state, f"edit {uid}")
+    touch(state, f"edit {uid}", previous_contexts=previous_contexts)
 
 
 def held_details(record):

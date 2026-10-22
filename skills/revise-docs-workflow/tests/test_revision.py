@@ -1494,6 +1494,52 @@ class CriterionWorkflowTests(unittest.TestCase):
 
 
 class ExpressionTrackingTests(unittest.TestCase):
+    def test_restoring_context_does_not_restore_old_unit_or_expression_results(self):
+        cases = [
+            ("before", "Before A.\n\n用語A。\n\nFar.\n\nUnaffected.\n", 0, 1),
+            ("after", "用語A。\n\nAfter A.\n\nFar.\n\nUnaffected.\n", 1, 0),
+            ("heading", "# Heading A\n\nBetween.\n\n用語A。\n\n# Other\n\nUnaffected.\n", 0, 2),
+            ("related", "Source A.\n\nBetween.\n\n用語A。\n\nFar.\n\nUnaffected.\n", 0, 2),
+        ]
+        for kind, text, source_index, owner_index in cases:
+            with self.subTest(kind=kind):
+                value = state(text, limit=5)
+                source, owner = value["units"][source_index], value["units"][owner_index]
+                if kind == "related":
+                    revision.annotate(value, owner["id"], revision.token(value, owner),
+                                      {"context_ids": [source["id"]]})
+                expression = self.register(value, unit=owner)
+                evidence = self.explanation(value, unit=owner)
+                evidence["evidence"][0]["token"] = revision.content_token(value, owner)
+                self.check(value, expression, evidence)
+                accept_all(value)
+                old_unit = revision.token(value, owner)
+                old_version = revision.expression_version(value, expression)
+                old_record = result_for(value, owner)
+                unrelated = value["units"][-1]
+                unrelated_token = revision.token(value, unrelated)
+                original = source["text"]
+                revision.edit(value, source["id"], revision.token(value, source), original.replace("A", "B"))
+                revision.record_review(value, source["id"], revision.token(value, source),
+                                       result_for(value, source, "confirmed"))
+                revision.edit(value, source["id"], revision.token(value, source), original)
+                self.assertNotEqual(revision.token(value, owner), old_unit)
+                self.assertNotEqual(revision.expression_version(value, expression), old_version)
+                self.assertFalse(revision.expression_review_current(value, expression))
+                with self.assertRaisesRegex(revision.RevisionError, "stale unit token"):
+                    revision.record_review(value, owner["id"], old_unit, old_record)
+                with self.assertRaisesRegex(revision.RevisionError, "stale expression version"):
+                    revision.record_expression(value, expression["id"], old_version, evidence)
+                with self.assertRaises(revision.RevisionError):
+                    revision.record_expression(value, expression["id"],
+                                               revision.expression_version(value, expression), evidence)
+                self.assertEqual(revision.token(value, unrelated), unrelated_token)
+                self.assertEqual(unrelated["state"], "unchanged")
+                self.check(value, expression, self.explanation(value, unit=owner))
+                accept_all(value)
+                final(value)
+                self.assertTrue(revision.finish(value)["fully_resolved"])
+
     def test_returning_to_old_goal_rejects_old_version_and_old_content_evidence(self):
         value = state("用語A。\n")
         unit = value["units"][0]
