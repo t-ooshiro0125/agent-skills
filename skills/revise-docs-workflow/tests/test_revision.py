@@ -223,6 +223,77 @@ class SegmentationTests(unittest.TestCase):
             revision.split_unit(value, unit["id"], revision.token(value, unit),
                                 [text[:cut], text[cut:]])
 
+    def test_lazy_list_and_quote_continuations_remain_with_their_item(self):
+        cases = [
+            ("- first line\nlazy continuation\n", "- second\n", "list"),
+            ("1. first line\nlazy continuation\n", "2. second\n", "list"),
+            ("> - first line\nlazy continuation\n", "> - second\n", "quote"),
+        ]
+        for first, second, kind in cases:
+            for merged in (False, True):
+                with self.subTest(kind=kind, merged=merged):
+                    value = state(first + second)
+                    self.assertEqual(len(value["units"]), 1)
+                    self.assertEqual(value["units"][0]["kind"], kind)
+                    self.assertIn("lazy continuation", value["units"][0]["text"])
+                    if merged:
+                        value = state("前の段落。\n\n" + first + second)
+                        uid = revision.merge_units(value, [u["id"] for u in value["units"]])
+                    else:
+                        uid = value["units"][0]["id"]
+                    unit = revision.unit_by_id(value, uid)
+                    text = unit["text"]
+                    cut = text.index("lazy continuation")
+                    with self.assertRaises(revision.RevisionError):
+                        revision.split_unit(value, uid, revision.token(value, unit),
+                                            [text[:cut], text[cut:]])
+                    cut = text.index(second)
+                    revision.split_unit(value, uid, revision.token(value, unit),
+                                        [text[:cut], text[cut:]])
+                    self.assertEqual(revision.render(value), value["original"])
+
+    def test_lists_end_at_blank_lines_headings_and_after_fenced_code(self):
+        first = "- " + TICKS + "sh\n  echo hi\n  " + TICKS + "\n"
+        cases = [("- first\n\n", "outside paragraph\n"),
+                 ("- first\n", "# Heading\n"),
+                 (first, "outside paragraph\n"),
+                 ("> first\n\n", "outside paragraph\n")]
+        for before, after in cases:
+            with self.subTest(text=before + after):
+                value = state(before + after)
+                self.assertEqual(len(value["units"]), 2)
+                self.assertEqual(value["units"][0]["text"], before)
+                uid = revision.merge_units(value, [u["id"] for u in value["units"]])
+                unit = revision.unit_by_id(value, uid)
+                revision.split_unit(value, uid, revision.token(value, unit), [before, after])
+                self.assertEqual(revision.render(value), before + after)
+
+    def test_single_column_tables_and_multiline_headings_preserve_boundaries(self):
+        table = "| Column |\n| - |\n| Value |\n"
+        value = state(table)
+        self.assertEqual(value["units"][0]["kind"], "table")
+        unit = value["units"][0]
+        with self.assertRaises(revision.RevisionError):
+            revision.split_unit(value, unit["id"], revision.token(value, unit),
+                                ["| Column |\n", "| - |\n| Value |\n"])
+        parts = ["| Column |\n| - |\n", "| Value |\n"]
+        revision.split_unit(value, unit["id"], revision.token(value, unit), parts)
+        heading = "First line\nSecond line\n===\n"
+        value = state(heading + "\nFollowing paragraph\n")
+        self.assertEqual(value["units"][0]["kind"], "heading")
+        self.assertEqual(revision.context(value, value["units"][1])["headings"][0]["level"], 1)
+        unit = value["units"][0]
+        with self.assertRaises(revision.RevisionError):
+            revision.split_unit(value, unit["id"], revision.token(value, unit),
+                                ["First line\n", "Second line\n===\n\n"])
+
+    def test_unrendered_reference_definitions_and_unicode_line_characters_are_lossless(self):
+        text = "[ref]: https://example.test/a\r\n\r\nTitle\u2028still the same line\r\n====\r\n"
+        value = state(text)
+        self.assertEqual(revision.render(value).encode(), text.encode())
+        self.assertEqual(value["units"][-1]["kind"], "heading")
+        self.assertIn("\u2028", value["units"][-1]["text"])
+
     def test_reorder_requires_complete_permutation_and_invalidates_all(self):
         value = state()
         accept_all(value)
@@ -413,6 +484,14 @@ class CliTests(unittest.TestCase):
                                  *map(str, args)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0 if success else 1, result.stderr)
         return result
+
+    def test_missing_dependency_reports_required_setup_without_writing_state(self):
+        result = subprocess.run([sys.executable, "-S", str(SCRIPT), "--state", str(self.path),
+                                 "status"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("requirements.txt", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(self.path.exists())
 
     def test_cli_roundtrip_and_failed_finish_leaves_output_untouched(self):
         self.cli("init", "--original", self.original, "--brief", self.brief)

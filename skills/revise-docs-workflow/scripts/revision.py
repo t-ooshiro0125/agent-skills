@@ -2,6 +2,7 @@
 """Keep local, versioned editing records; never call a model or judge prose."""
 import argparse
 from collections import Counter
+from functools import lru_cache
 import copy
 import hashlib
 import json
@@ -13,6 +14,12 @@ import sys
 import tempfile
 
 
+try:
+    from markdown_it import MarkdownIt
+except ImportError:
+    raise SystemExit("revision: install this skill's requirements.txt into the current Python environment")
+
+
 class RevisionError(ValueError):
     pass
 
@@ -20,10 +27,17 @@ class RevisionError(ValueError):
 STATES = {"pending", "recheck", "confirmed", "unchanged", "held"}
 TERMINAL = {"confirmed", "unchanged", "held"}
 OPAQUE = {"ok", "okay", "問題なし", "確認済み", "完了", "変更なし", "修正済み"}
-TICK = chr(96)
-FENCE = re.compile(r"^ {0,3}(" + TICK + r"{3,}|~{3,})(.*)$")
-HEADING = re.compile(r"^ {0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
-LIST = re.compile(r"^( {0,3})(?:[-+*]|\d+[.)])\s+")
+MARKDOWN = MarkdownIt("commonmark").enable("table")
+
+
+def source_lines(text):
+    # Match CommonMark line endings without rewriting CRLF, BOM, or Unicode text.
+    return re.findall(r"[^\r\n]*(?:\r\n|\r|\n|$)", text)[:-1]
+
+
+@lru_cache(maxsize=128)
+def syntax(text):
+    return tuple(MARKDOWN.parse(text))
 
 
 def digest(value):
@@ -102,87 +116,37 @@ def write_atomic(path, text):
     write_many_atomic([(path, text)])
 
 
-def table_start(lines, i):
-    if i + 1 >= len(lines) or "|" not in lines[i]:
-        return False
-    cells = lines[i + 1].strip().strip("|").split("|")
-    return len(cells) >= 2 and all(re.fullmatch(r"\s*:?-{3,}:?\s*", c) for c in cells)
-
-
-def fence_end(lines, i):
-    marker = FENCE.match(lines[i]).group(1)
-    closing = re.compile(r"^ {0,3}" + re.escape(marker[0]) + "{" + str(len(marker)) + r",}\s*$")
-    i += 1
-    while i < len(lines):
-        if closing.match(lines[i]):
-            return i + 1
-        i += 1
-    return i
-
-
 def blocks(text):
-    """Return exact text slices. Boundaries are candidates, not semantic units."""
-    lines = text.splitlines(keepends=True)
-    result, i = [], 0
-    while i < len(lines):
-        start = i
-        if not lines[i].strip():
-            while i < len(lines) and not lines[i].strip():
-                i += 1
+    """Slice the original source at root block boundaries, including unrendered text."""
+    lines = source_lines(text)
+    result, position = [], 0
+    kinds = {"fence": "code", "code_block": "code", "heading_open": "heading",
+             "bullet_list_open": "list", "ordered_list_open": "list",
+             "blockquote_open": "quote", "table_open": "table", "html_block": "html"}
+    for node in syntax(text):
+        if node.level != 0 or node.map is None or node.nesting == -1:
+            continue
+        start, end = node.map
+        if start > position:
+            gap = "".join(lines[position:start])
             if result:
-                result[-1]["text"] += "".join(lines[start:i])
-                continue
-            kind = "spacing"
-        elif FENCE.match(lines[i]):
-            kind, i = "code", fence_end(lines, i)
-        elif table_start(lines, i):
-            kind, i = "table", i + 2
-            while i < len(lines) and lines[i].strip() and "|" in lines[i]:
-                i += 1
-        elif HEADING.match(lines[i].lstrip("\ufeff")):
-            kind, i = "heading", i + 1
-        elif i + 1 < len(lines) and re.fullmatch(r" {0,3}(=+|-+)\s*", lines[i + 1]):
-            kind, i = "heading", i + 2
-        elif LIST.match(lines[i]):
-            kind, i = "list", i + 1
-            while i < len(lines):
-                if FENCE.match(lines[i]) and lines[i].startswith(" "):
-                    i = fence_end(lines, i)
-                elif LIST.match(lines[i]) or lines[i].startswith((" ", "\t")):
-                    i += 1
-                elif not lines[i].strip():
-                    look = i + 1
-                    while look < len(lines) and not lines[look].strip():
-                        look += 1
-                    if look < len(lines) and (LIST.match(lines[look]) or lines[look].startswith((" ", "\t"))):
-                        i = look
-                    else:
-                        break
-                else:
-                    break
-        elif lines[i].startswith(("    ", "\t")):
-            kind, i = "code", i + 1
-            while i < len(lines) and (not lines[i].strip() or lines[i].startswith(("    ", "\t"))):
-                i += 1
-        elif re.match(r"^ {0,3}>", lines[i]):
-            kind, i = "quote", i + 1
-            while i < len(lines) and re.match(r"^ {0,3}>", lines[i]):
-                i += 1
-        elif lines[i].lstrip().startswith("<!--"):
-            kind, i = "html", i + 1
-            while "-->" not in lines[i - 1] and i < len(lines):
-                i += 1
+                result[-1]["text"] += gap
+            else:
+                result.append({"kind": "spacing" if not gap.strip() else "paragraph", "text": gap})
+        block = {"kind": kinds.get(node.type, "paragraph"), "text": "".join(lines[start:end])}
+        if node.type == "heading_open":
+            block["level"] = int(node.tag[1:])
+        result.append(block)
+        position = end
+    tail = "".join(lines[position:])
+    if tail:
+        if result:
+            result[-1]["text"] += tail
         else:
-            kind, i = "paragraph", i + 1
-            while i < len(lines) and lines[i].strip():
-                if HEADING.match(lines[i]) or LIST.match(lines[i]) or FENCE.match(lines[i]) or table_start(lines, i):
-                    break
-                i += 1
-        while i < len(lines) and not lines[i].strip():
-            i += 1
-        result.append({"kind": kind, "text": "".join(lines[start:i])})
-    assert "".join(b["text"] for b in result) == text
+            result.append({"kind": "spacing" if not tail.strip() else "paragraph", "text": tail})
+    assert "".join(block["text"] for block in result) == text
     return result
+
 
 
 def require_text(value, name):
@@ -238,9 +202,7 @@ def context(state, unit):
         for block in blocks(previous["text"]):
             if block["kind"] != "heading":
                 continue
-            line = block["text"].splitlines()[0].lstrip("\ufeff")
-            match = HEADING.match(line)
-            level = len(match.group(1)) if match else (1 if "=" in block["text"].splitlines()[1] else 2)
+            level = block["level"]
             headings = [h for h in headings if h["level"] < level]
             headings.append({"level": level, "text": block["text"]})
     refs = [{"id": uid, "text": unit_by_id(state, uid)["text"]} for uid in unit["context_ids"]]
@@ -311,7 +273,7 @@ def check_token(state, unit, expected):
 def view(state, unit):
     original = unit["notes"].get("original_lines")
     if original:
-        lines = state["original"].splitlines(keepends=True)
+        lines = source_lines(state["original"])
         original_text = "".join(lines[original[0] - 1:original[1]])
         original_scope = "specified_lines"
     elif unit["initial_text"] in state["original"]:
@@ -374,7 +336,7 @@ def annotate(state, uid, expected, data):
         bounds = data["original_lines"]
         if (not isinstance(bounds, list) or len(bounds) != 2 or
                 any(type(n) is not int for n in bounds) or
-                not 1 <= bounds[0] <= bounds[1] <= len(state["original"].splitlines())):
+                not 1 <= bounds[0] <= bounds[1] <= len(source_lines(state["original"]))):
             raise RevisionError("original_lines must be an inclusive range in the original snapshot")
     unit["context_ids"] = list(dict.fromkeys(refs))
     unit["history"].append({"action": "annotate", "notes": copy.deepcopy(unit["notes"])})
@@ -469,83 +431,47 @@ def record_review(state, uid, expected, record):
 
 
 def safe_cuts(text, cuts, kind):
-    # Regroup a compound target at block boundaries before subdividing a table/code block.
-    offset = 0
-    for block in blocks(text):
-        end = offset + len(block["text"])
-        if block["kind"] in {"code", "heading"} and any(offset < c < end for c in cuts):
-            raise RevisionError("keep code blocks and headings together")
-        if block["kind"] == "table" and kind not in {"table", "table_rows"}:
-            if any(offset < c < end for c in cuts):
-                raise RevisionError("separate the whole table before splitting its rows")
-        if block["kind"] == "list":
-            list_lines = block["text"].splitlines(keepends=True)
-            indent = len(LIST.match(list_lines[0]).group(1))
-            boundaries, position = set(), offset
-            for line in list_lines:
-                item = LIST.match(line)
-                if item and len(item.group(1)) == indent:
-                    boundaries.add(position)
-                position += len(line)
-            if any(offset < cut < end and cut not in boundaries for cut in cuts):
-                raise RevisionError("split lists only between complete top-level items")
-        if block["kind"] == "quote":
-            inside = [cut - offset for cut in cuts if offset < cut < end]
-            if inside:
-                raw_position, inner_position, boundaries, inner_lines = 0, 0, {}, []
-                for line in block["text"].splitlines(keepends=True):
-                    boundaries[raw_position] = inner_position
-                    expanded = line.expandtabs(4)
-                    prefix = re.match(r"^ {0,3}>[ \t]?", expanded)
-                    inner = expanded[prefix.end():] if prefix else expanded
-                    inner_lines.append(inner)
-                    raw_position += len(line)
-                    inner_position += len(inner)
-                if any(cut not in boundaries for cut in inside):
-                    raise RevisionError("split quotes only before complete quoted lines")
-                inner_text = "".join(inner_lines)
-                candidates = blocks(inner_text)
-                inner_kind = candidates[0]["kind"] if len(candidates) == 1 else "group"
-                safe_cuts(inner_text, [boundaries[cut] for cut in inside], inner_kind)
-        offset = end
-    offset = 0
-    lines = text.splitlines(keepends=True)
-    unquoted = []
+    lines = source_lines(text)
+    offsets = [0]
     for line in lines:
-        line = line.expandtabs(4)
-        # A fence may be nested in one or more blockquotes.
-        prefix = re.match(r"^ {0,3}>[ \t]?", line)
-        while prefix:
-            line = line[prefix.end():]
-            prefix = re.match(r"^ {0,3}>[ \t]?", line)
-        unquoted.append(line)
-    i = 0
-    while i < len(lines):
-        if FENCE.match(unquoted[i].lstrip(" ")):
-            # Lists can contain indented fences which must also stay whole.
-            indent = len(unquoted[i]) - len(unquoted[i].lstrip(" "))
-            normalized = [line[indent:] if line.startswith(" " * indent) else line
-                          for line in unquoted]
-            end = fence_end(normalized, i)
-            bound = offset + sum(len(s) for s in lines[i:end])
-            if any(offset < cut < bound for cut in cuts):
-                raise RevisionError("cannot split inside a fenced code block")
-            offset, i = bound, end
-        else:
-            offset += len(lines[i])
-            i += 1
-    if kind == "code" and cuts:
-        raise RevisionError("keep an indented code block together")
-    if kind in {"table", "table_rows"}:
-        boundaries = {0}
-        offset = 0
-        for line in lines:
-            offset += len(line)
-            boundaries.add(offset)
-        if any(cut not in boundaries for cut in cuts):
-            raise RevisionError("split tables only between complete rows")
-        if table_start(lines, 0) and any(0 < cut < len(lines[0]) + len(lines[1]) for cut in cuts):
-            raise RevisionError("keep table column names and delimiter together")
+        offsets.append(offsets[-1] + len(line))
+    line_starts = {offset: index for index, offset in enumerate(offsets)}
+    quoted = []
+    for node in syntax(text):
+        if node.map is None:
+            continue
+        first, last = node.map
+        start, end = offsets[first], offsets[last]
+        inside = [cut for cut in cuts if start < cut < end]
+        if node.type in {"fence", "code_block", "heading_open", "html_block"} and inside:
+            raise RevisionError("keep code blocks, headings, and HTML blocks together")
+        if node.type == "list_item_open" and inside:
+            raise RevisionError("split lists only between complete top-level items")
+        if node.type == "table_open":
+            if inside and kind not in {"table", "table_rows", "quote"}:
+                raise RevisionError("separate the whole table before splitting its rows")
+            header_end = offsets[min(first + 2, last)]
+            if any(cut not in line_starts or cut < header_end for cut in inside):
+                raise RevisionError("split tables between rows; keep column names and delimiter together")
+        if node.type == "blockquote_open":
+            quoted.append((start, end))
+    if kind == "table_rows" and any(cut not in line_starts for cut in cuts):
+        raise RevisionError("split tables only between complete rows")
+    for cut in cuts:
+        depth = sum(start < cut < end for start, end in quoted)
+        if not depth:
+            continue
+        if cut not in line_starts or line_starts[cut] == len(lines):
+            raise RevisionError("split quotes only before complete quoted lines")
+        line, prefixes = lines[line_starts[cut]].expandtabs(4), 0
+        match = re.match(r"^ {0,3}> ?", line)
+        while match:
+            prefixes += 1
+            line = line[match.end():]
+            match = re.match(r"^ {0,3}> ?", line)
+        if prefixes < depth:
+            raise RevisionError("keep lazy quote continuations with their paragraph")
+
 
 
 def replace_units(state, old, new, reason):

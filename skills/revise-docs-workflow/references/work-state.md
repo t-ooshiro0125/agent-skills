@@ -1,6 +1,12 @@
 # 作業状態の操作
 
-Python 3 の標準ライブラリだけを使う。以下の `revision.py` は、このスキルの `scripts/revision.py` の絶対パスに置き換える。状態・入力・中間ファイルは利用先の規約に従うローカルの作業場所へ置き、秘密情報を含む記録を公開しない。状態 JSON を直接編集せず、同じ状態への書き込みは逐次実行する。
+Python 3.10 以上と [markdown-it-py](https://pypi.org/project/markdown-it-py/) を使う。利用先の規約に従う Python 環境へ、先に依存パッケージを導入する。新しい環境が必要なら、作業用の仮想環境を用意し、その Python を以降の `python3` として使う。
+
+```sh
+python3 -m pip install -r /path/to/revise-docs-workflow/requirements.txt
+```
+
+依存バージョンは [requirements.txt](../requirements.txt) に固定している。Markdown の構文解析で候補と切断可能位置を判断し、本文は元の文字列から切り出して再構成する。以下の `revision.py` は、このスキルの `scripts/revision.py` の絶対パスに置き換える。状態・入力・中間ファイルは利用先の規約に従うローカルの作業場所へ置き、秘密情報を含む記録を公開しない。状態 JSON を直接編集せず、同じ状態への書き込みは逐次実行する。
 
 ## 開始と分割
 
