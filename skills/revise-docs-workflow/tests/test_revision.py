@@ -518,6 +518,7 @@ class ReviewTests(unittest.TestCase):
         revision.annotate(value, unit["id"], revision.token(value, unit),
                           {"findings": ["条件が不明"]})
         revision.record_review(value, unit["id"], revision.token(value, unit), hold())
+        revision.invalidate(value, [unit["id"]], "保留していた条件の根拠が得られた")
         old = copy.deepcopy(unit)
         revision.merge_units(value, [u["id"] for u in value["units"][:2]])
         self.assertIn(old, value["retired"])
@@ -525,6 +526,68 @@ class ReviewTests(unittest.TestCase):
         records = revision.history(value, value["units"][0]["id"])["records"]
         self.assertIn(old, records)
         self.assertEqual(revision.history(value, old["id"])["records"][0], old)
+
+    def test_regrouping_rejects_held_targets_without_losing_the_hold(self):
+        for operation, held_index in (("split", 0), ("merge", 0), ("merge", 1)):
+            with self.subTest(operation=operation, held_index=held_index):
+                value = state("前の説明。\n\n後の説明。\n")
+                if operation == "split":
+                    revision.merge_units(value, [u["id"] for u in value["units"]])
+                accept_all(value)
+                unit = value["units"][held_index]
+                revision.record_review(value, unit["id"], revision.token(value, unit),
+                                       result_for(value, unit, "held"))
+                final(value)
+                before = copy.deepcopy(value)
+                def regroup():
+                    if operation == "split":
+                        return revision.split_unit(value, unit["id"], revision.token(value, unit),
+                                                   ["前の説明。\n\n", "後の説明。\n"])
+                    return revision.merge_units(value, [u["id"] for u in value["units"]])
+                with self.assertRaisesRegex(revision.RevisionError, "held.*invalidate"):
+                    regroup()
+                self.assertEqual(value, before)
+                result = revision.finish(value)
+                self.assertFalse(result["fully_resolved"])
+                self.assertEqual(result["held"][0]["record"], unit["review"]["record"])
+                revision.invalidate(value, [unit["id"]], "不足していた条件を確認した")
+                regroup()
+                retired = next(u for u in value["retired"] if u["id"] == unit["id"])
+                self.assertEqual(retired["review"], unit["review"])
+                self.assertTrue(all(u["attempts"] == 2 for u in value["units"]))
+                with self.assertRaises(revision.RevisionError):
+                    revision.finish(value)
+
+    def test_regrouping_requires_the_last_edit_to_be_checked(self):
+        for operation, edited_index in (("split", 0), ("merge", 0), ("merge", 1)):
+            with self.subTest(operation=operation, edited_index=edited_index):
+                value = state("前の説明。\n\n後の説明。\n")
+                if operation == "split":
+                    revision.merge_units(value, [u["id"] for u in value["units"]])
+                unit = value["units"][edited_index]
+                edited = unit["text"].replace("説明", "明確な説明", 1)
+                revision.edit(value, unit["id"], revision.token(value, unit), edited)
+                def regroup():
+                    if operation == "split":
+                        cut = edited.index("\n\n") + 2
+                        return revision.split_unit(value, unit["id"], revision.token(value, unit),
+                                                   [edited[:cut], edited[cut:]])
+                    return revision.merge_units(value, [u["id"] for u in value["units"]])
+                for invalidate_first in (False, True):
+                    if invalidate_first:
+                        revision.invalidate(value, [unit["id"]], "追加の文脈を再確認する")
+                    before = copy.deepcopy(value)
+                    with self.assertRaisesRegex(revision.RevisionError, "last edit.*before regrouping"):
+                        regroup()
+                    self.assertEqual(value, before)
+                    self.assertTrue(unit["awaiting_review"])
+                    with self.assertRaisesRegex(revision.RevisionError, "last edit before editing"):
+                        revision.edit(value, unit["id"], revision.token(value, unit), "次の修正。\n")
+                revision.record_review(value, unit["id"], revision.token(value, unit),
+                                       result_for(value, unit, "confirmed"))
+                regroup()
+                self.assertEqual(revision.render(value), edited if operation == "split" else
+                                 "".join(u["text"] for u in value["retired"][-2:]))
 
 
 class CriterionWorkflowTests(unittest.TestCase):
@@ -824,6 +887,52 @@ class CliTests(unittest.TestCase):
                                  *map(str, args)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0 if success else 1, result.stderr)
         return result
+
+    def test_regrouping_blocks_held_and_unchecked_edits_without_rewriting_state(self):
+        for operation in ("split", "merge"):
+            for barrier in ("held", "awaiting_review"):
+                with self.subTest(operation=operation, barrier=barrier):
+                    value = state("前の説明。\n\n後の説明。\n")
+                    if operation == "split":
+                        revision.merge_units(value, [u["id"] for u in value["units"]])
+                    unit = value["units"][-1]
+                    if barrier == "held":
+                        revision.record_review(value, unit["id"], revision.token(value, unit),
+                                               result_for(value, unit, "held"))
+                    else:
+                        revision.edit(value, unit["id"], revision.token(value, unit),
+                                      unit["text"].replace("説明", "明確な説明", 1))
+                    revision.save(self.path, value)
+                    parts_file = self.root / "parts.json"
+                    if operation == "split":
+                        cut = unit["text"].index("\n\n") + 2
+                        parts_file.write_text(json.dumps([unit["text"][:cut], unit["text"][cut:]]))
+                    def regroup(success):
+                        if operation == "split":
+                            current = revision.load(self.path)
+                            self.cli("split", "--unit", unit["id"], "--token",
+                                     revision.token(current, current["units"][0]),
+                                     "--file", parts_file, success=success)
+                        else:
+                            self.cli("merge", "--units", *[u["id"] for u in value["units"]],
+                                     success=success)
+                    before = self.path.read_bytes()
+                    regroup(False)
+                    self.assertEqual(self.path.read_bytes(), before)
+                    if barrier == "held":
+                        self.cli("invalidate", "--units", unit["id"], "--reason", "不足条件を確認した")
+                    else:
+                        result_file = self.root / "result.json"
+                        result_file.write_text(json.dumps(result_for(value, unit, "confirmed")))
+                        self.cli("record", "--unit", unit["id"], "--token", revision.token(value, unit),
+                                 "--file", result_file)
+                    regroup(True)
+                    current = revision.load(self.path)
+                    self.assertEqual(revision.render(current), revision.render(value))
+                    self.assertTrue(any(u["id"] == unit["id"] for u in current["retired"]))
+                    output = self.root / "output.md"
+                    self.cli("finish", "--output", output, success=False)
+                    self.assertFalse(output.exists())
 
     def test_missing_dependency_reports_required_setup_without_writing_state(self):
         result = subprocess.run([sys.executable, "-S", str(SCRIPT), "--state", str(self.path),

@@ -638,6 +638,14 @@ def safe_cuts(text, cuts, kind):
 
 
 
+def check_regroupable(units):
+    for unit in units:
+        if unit["state"] == "held":
+            raise RevisionError("held unit: invalidate with the new information/decision before regrouping")
+        if unit["awaiting_review"]:
+            raise RevisionError("record the check of the last edit before regrouping")
+
+
 def replace_units(state, old, new, reason):
     ids = [u["id"] for u in old]
     positions = [state["units"].index(u) for u in old]
@@ -661,6 +669,7 @@ def replace_units(state, old, new, reason):
 def split_unit(state, uid, expected, parts):
     unit = unit_by_id(state, uid)
     check_token(state, unit, expected)
+    check_regroupable([unit])
     if (not isinstance(parts, list) or len(parts) < 2 or
             any(not isinstance(p, str) or not p for p in parts) or "".join(parts) != unit["text"]):
         raise RevisionError("split parts must be nonempty and concatenate exactly to the current target")
@@ -705,6 +714,7 @@ def merge_units(state, ids):
     positions = [state["units"].index(u) for u in old]
     if positions != list(range(positions[0], positions[0] + len(old))):
         raise RevisionError("merge requires contiguous units in document order")
+    check_regroupable(old)
     text = "".join(u["text"] for u in old)
     new = make_unit(state, text, "group", ids)
     new["notes"]["inherited"] = [copy.deepcopy(u["notes"]) for u in old]

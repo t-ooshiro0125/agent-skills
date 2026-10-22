@@ -43,6 +43,8 @@ python3 revision.py --state work.json next
 
 候補は意味の切れ目を担当スキルで判断して調整する。条件と手順、説明と表などが離れていたら、連続する候補を結合するか関連付ける。表は行単位に分割できるが、列名と区切り行、コードブロック、見出し、区切り線は途中で切らない。リストは継続行・入れ子を含む上位項目単位で分ける。複数の構造を結合した対象は、まず表やコードを丸ごと取り出してから細分化する。
 
+保留中、または直前の編集の確認待ちの対象が含まれると、`split`・`merge` は状態を変えずに拒否する。保留は新しい根拠や判断を得て理由付きの `invalidate` で再確認待ちへ戻す。直前の編集は `record` で確認結果を保存してから再編成する。編集の確認待ちは `invalidate` だけでは解除されない。
+
 ```sh
 python3 revision.py --state work.json merge --units u0002 u0003
 python3 revision.py --state work.json split --unit u0004 --token TOKEN --file parts.json
