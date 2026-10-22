@@ -822,11 +822,11 @@ def migrate_release(state, uid, expected, review_token, evidence):
     unit = unit_by_id(state, uid)
     check_token(state, unit, expected)
     require_text(evidence, "evidence of the previous explicit invalidation")
-    review = unit.get("review")
-    if ("hold_released_token" in unit or unit.get("hold_active", False) is not False
-            or unit["state"] != "recheck" or not has_active_hold(unit)):
+    held = current_unit_hold(unit)
+    if (unit.get("hold_released_token") is not None or unit.get("hold_active", False) is not False
+            or unit["state"] not in {"recheck", "confirmed", "unchanged"} or held is None):
         raise RevisionError("release migration requires a legacy, cleared hold without release metadata")
-    if not isinstance(review, dict) or not review_token or review.get("token") != review_token:
+    if not review_token or held_review_key(held) != review_token:
         raise RevisionError("stale held review token")
     if expected == review_token:
         raise RevisionError("the held review is still current; use invalidate with new information/decision")

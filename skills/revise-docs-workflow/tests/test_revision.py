@@ -127,6 +127,17 @@ def legacy_document_hold():
     return value
 
 
+def legacy_released_historical_hold(outcome="confirmed"):
+    value = state("対象の説明。\n", limit=6)
+    unit = value["units"][0]
+    revision.record_review(value, unit["id"], revision.token(value, unit), hold())
+    held_token = unit["review"]["token"]
+    revision.invalidate(value, [unit["id"]], "旧版で保留事項の判断を得た")
+    unit["history"] = [entry for entry in unit["history"] if entry["action"] != "release_hold"]
+    revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit, outcome))
+    return value, unit, held_token
+
+
 class SegmentationTests(unittest.TestCase):
     def test_edit_and_reorder_preserve_the_complete_leading_bom_prefix(self):
         for count in (1, 2):
@@ -816,6 +827,39 @@ class SegmentationTests(unittest.TestCase):
 
 
 class ReviewTests(unittest.TestCase):
+    def test_migration_of_old_historical_releases_preserves_newer_passed_results(self):
+        for outcome in ("confirmed", "unchanged"):
+            for marker in ("null", "absent"):
+                with self.subTest(outcome=outcome, marker=marker):
+                    value, unit, held_token = legacy_released_historical_hold(outcome)
+                    if marker == "absent":
+                        unit.pop("hold_released_token")
+                    current_token = revision.token(value, unit)
+                    self.assertNotEqual(held_token, current_token)
+                    self.assertTrue(revision.has_active_hold(unit))
+                    before = copy.deepcopy(value)
+                    with self.assertRaisesRegex(revision.RevisionError, "stale held review token"):
+                        revision.migrate_release(value, unit["id"], current_token, current_token,
+                                                 "旧ログの解除理由を確認した")
+                    self.assertEqual(value, before)
+                    revision.migrate_release(value, unit["id"], current_token, held_token,
+                                             "旧ログでこの対象のinvalidateと判断内容を確認した")
+                    self.assertFalse(revision.has_active_hold(unit))
+                    for field in ("id", "text", "state", "generation", "attempts", "review", "plan"):
+                        self.assertEqual(unit[field], before["units"][0][field])
+                    self.assertEqual(unit["history"][:-1], before["units"][0]["history"])
+                    self.assertEqual(revision.token(value, unit), current_token)
+                    final(value)
+                    self.assertTrue(revision.finish(value)["fully_resolved"])
+                    revision.record_review(value, unit["id"], revision.token(value, unit), hold())
+                    with self.assertRaises(revision.RevisionError):
+                        revision.migrate_release(value, unit["id"], revision.token(value, unit), held_token,
+                                                 "過去の解除理由")
+        value, unit = legacy_overwritten_unit_hold()
+        with self.assertRaisesRegex(revision.RevisionError, "held review is still current"):
+            revision.migrate_release(value, unit["id"], revision.token(value, unit), unit["review"]["token"],
+                                     "同じ版の上書きに過去の解除を流用しない")
+
     def test_restored_text_is_confirmed_and_change_status_survives_regrouping(self):
         value = state("First.\n\nSecond.\n", limit=6)
         unit = value["units"][0]
@@ -2242,6 +2286,26 @@ class ExpressionTrackingTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_cli_migrates_a_historical_release_after_an_old_passed_result(self):
+        value, unit, held_token = legacy_released_historical_hold()
+        self.assertIsNone(unit["hold_released_token"])
+        self.path.write_text(json.dumps(value))
+        current_token = revision.token(value, unit)
+        result = self.cli("migrate-release", "--unit", unit["id"], "--token", current_token,
+                          "--review-token", held_token, "--evidence", "旧ログの対象・invalidate・解除理由を確認した")
+        shown = json.loads(result.stdout)["target"]
+        self.assertFalse(shown["hold_active"])
+        self.assertEqual(shown["state"], "confirmed")
+        self.assertEqual(shown["token"], current_token)
+        current = revision.load(self.path)
+        for field in ("id", "text", "state", "generation", "attempts", "review"):
+            self.assertEqual(current["units"][0][field], unit[field])
+        final(current)
+        revision.save(self.path, current)
+        output = self.root / "output.md"
+        result = self.cli("finish", "--output", output)
+        self.assertTrue(json.loads(result.stdout)["fully_resolved"])
+
     def test_json_output_handles_emoji_with_cp932_stdout_before_and_after_export(self):
         value = state("Original.\n", limit=6)
         brief = copy.deepcopy(value["brief"])
