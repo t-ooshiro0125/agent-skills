@@ -99,7 +99,37 @@ def final(value):
         "checks": result_for(value)["checks"]})
 
 
+def legacy_overwritten_unit_hold(outcome="unchanged"):
+    value = state("対象の説明。\n\n関連の説明。\n", limit=6)
+    accept_all(value)
+    final(value)
+    full = copy.deepcopy(value["final_review"])
+    unit = value["units"][0]
+    revision.record_review(value, unit["id"], revision.token(value, unit), hold())
+    overwritten = copy.deepcopy(unit["review"])
+    overwritten["record"] = result_for(value, unit, outcome)
+    unit.update(review=overwritten, state=outcome, hold_active=False, hold_released_token=None)
+    unit["history"].append({"action": "review", **copy.deepcopy(overwritten)})
+    value["final_review"] = full
+    return value, unit
+
+
 class SegmentationTests(unittest.TestCase):
+    def test_reorder_keeps_the_leading_bom_at_the_start(self):
+        value = state("\ufeff# Title\r\n\r\nFirst.\r\n\r\nSecond.\r\n")
+        first, second, third = value["units"]
+        before = copy.deepcopy(value)
+        with self.assertRaisesRegex(revision.RevisionError, "leading BOM"):
+            revision.reorder(value, [second["id"], first["id"], third["id"]])
+        self.assertEqual(value, before)
+        revision.reorder(value, [first["id"], third["id"], second["id"]])
+        self.assertTrue(revision.render(value).startswith("\ufeff# Title\r\n"))
+        self.assertEqual(revision.context(value, third)["headings"],
+                         [{"level": 1, "text": first["text"]}])
+        accept_all(value)
+        final(value)
+        self.assertTrue(revision.finish(value)["text"].startswith("\ufeff"))
+
     def test_edit_reclassifies_whole_targets_before_splitting(self):
         table_parts = ["| A | B |\n| --- | --- |\n", "| x | 1 |\n", "| y | 2 |\n"]
         cases = [("table", "".join(table_parts), table_parts),
@@ -678,6 +708,56 @@ class SegmentationTests(unittest.TestCase):
 
 
 class ReviewTests(unittest.TestCase):
+    def test_old_overwritten_unit_holds_block_completion_until_explicit_release(self):
+        for outcome in ("confirmed", "unchanged"):
+            with self.subTest(outcome=outcome):
+                value, unit = legacy_overwritten_unit_hold(outcome)
+                self.assertTrue(revision.has_active_hold(unit))
+                before = copy.deepcopy(value)
+                for operation in (
+                    lambda: revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit)),
+                    lambda: revision.edit(value, unit["id"], revision.token(value, unit), "対象を明示した説明。\n\n"),
+                    lambda: revision.merge_units(value, [u["id"] for u in value["units"]]),
+                    lambda: final(value),
+                    lambda: revision.finish(value)):
+                    with self.assertRaises(revision.RevisionError):
+                        operation()
+                    self.assertEqual(value, before)
+                held_key = revision.held_review_key(revision.current_unit_hold(unit))
+                revision.invalidate(value, [unit["id"]], "過去の保留事項について判断を確認した")
+                self.assertEqual(unit["history"][-1], {"action": "release_hold", "review_token": held_key,
+                                                       "reason": "過去の保留事項について判断を確認した"})
+                self.assertFalse(revision.has_active_hold(unit))
+                accept_all(value)
+                final(value)
+                self.assertTrue(revision.finish(value)["fully_resolved"])
+
+    def test_unit_hold_release_history_survives_new_results_and_only_releases_its_hold(self):
+        value = state("対象。\n", limit=6)
+        unit = value["units"][0]
+        revision.record_review(value, unit["id"], revision.token(value, unit), hold())
+        first_key = unit["review"]["token"]
+        revision.invalidate(value, [unit["id"]], "最初の保留事項を確認した")
+        revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit))
+        self.assertIsNone(unit["hold_released_token"])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            revision.save(path, value)
+            value = revision.load(path)
+        unit = value["units"][0]
+        self.assertFalse(revision.has_active_hold(unit))
+        revision.record_review(value, unit["id"], revision.token(value, unit), hold())
+        second_key = unit["review"]["token"]
+        revision.annotate(value, unit["id"], revision.token(value, unit), {"context_note": "再点検の文脈"})
+        unit["hold_active"], unit["hold_released_token"] = False, first_key
+        unit["history"].extend([{"action": "release_hold", "review_token": second_key, "reason": " "},
+                                {"action": "release_hold", "review_token": first_key, "reason": "古い解除"}])
+        self.assertTrue(revision.has_active_hold(unit))
+        revision.invalidate(value, [unit["id"]], "新しい保留事項の判断を確認した")
+        accept_all(value)
+        final(value)
+        self.assertTrue(revision.finish(value)["fully_resolved"])
+
     def test_pending_and_recheck_cannot_finish(self):
         value = state()
         with self.assertRaises(revision.RevisionError):
@@ -999,6 +1079,7 @@ class ReviewTests(unittest.TestCase):
                 old_token = unit["review"]["token"]
                 revision.invalidate(value, [unit["id"]], "必要な情報と判断を得て再開する")
                 del unit["hold_released_token"]
+                unit["history"] = [entry for entry in unit["history"] if entry["action"] != "release_hold"]
                 before = copy.deepcopy(value)
                 revision.migrate_release(value, unit["id"], revision.token(value, unit), old_token,
                                          "旧実行ログに、この対象の明示invalidateと判断内容が記録されている")
@@ -1931,6 +2012,25 @@ class ExpressionTrackingTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_cli_rejects_old_overwritten_unit_holds_without_saving(self):
+        value, unit = legacy_overwritten_unit_hold()
+        self.path.write_text(json.dumps(value))
+        shown = json.loads(self.cli("show", "--unit", unit["id"]).stdout)["target"]
+        self.assertTrue(shown["hold_active"])
+        before = self.path.read_bytes()
+        result_file = self.root / "result.json"
+        result_file.write_text(json.dumps(result_for(value, unit)))
+        self.cli("record", "--unit", unit["id"], "--token", shown["token"], "--file", result_file, success=False)
+        self.cli("finish", "--output", self.root / "output.md", success=False)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertFalse((self.root / "output.md").exists())
+        self.cli("invalidate", "--units", unit["id"], "--reason", "過去の保留事項の判断を得た")
+        current = revision.load(self.path)
+        accept_all(current)
+        final(current)
+        revision.save(self.path, current)
+        self.cli("finish", "--output", self.root / "output.md")
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -2167,6 +2267,7 @@ class CliTests(unittest.TestCase):
         old_token = unit["review"]["token"]
         revision.invalidate(value, [unit["id"]], "必要な情報と判断を得た")
         del unit["hold_released_token"]
+        unit["history"] = [entry for entry in unit["history"] if entry["action"] != "release_hold"]
         self.path.write_text(json.dumps(value))
         migrated = json.loads(self.cli("migrate-release", "--unit", unit["id"],
                                       "--token", revision.token(value, unit), "--review-token", old_token,
@@ -2206,6 +2307,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), before)
         revision.invalidate(value, [unit["id"]], "旧版で必要な判断を得た")
         del unit["hold_released_token"]
+        unit["history"] = [entry for entry in unit["history"] if entry["action"] != "release_hold"]
         self.path.write_text(json.dumps(value))
         before = self.path.read_bytes()
         for token_value, evidence in (("wrong-review-token", "旧ログを確認した"),
@@ -2389,7 +2491,9 @@ class CliTests(unittest.TestCase):
         self.assertEqual(current["format"], 2)
         self.assertEqual(current["max_iterations"], 2)
         self.assertEqual(current["units"][0]["attempts"], 1)
-        self.assertEqual(current["units"][0]["history"], value["units"][0]["history"])
+        self.assertEqual(current["units"][0]["history"][:-1], value["units"][0]["history"])
+        self.assertEqual(current["units"][0]["history"][-1], {
+            "action": "release_hold", "review_token": unit["review"]["token"], "reason": "必要な上限値を確認できた"})
         self.cli("edit", "--unit", unit["id"], "--token", target["token"], "--file", edit_file)
         current = revision.load(self.path)
         target = json.loads(self.cli("show", "--unit", unit["id"]).stdout)["target"]

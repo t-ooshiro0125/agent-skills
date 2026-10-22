@@ -652,17 +652,41 @@ def check_token(state, unit, expected):
         raise RevisionError("stale unit token: retrieve the target and its context again")
 
 
-def has_active_hold(unit):
-    review = unit.get("review")
+def review_has_hold(review):
     record = review.get("record", review) if isinstance(review, dict) else {}
     checks = record.get("checks", []) if isinstance(record, dict) else []
-    previous_hold = (isinstance(record, dict) and record.get("outcome") == "held") or (
+    return (isinstance(record, dict) and record.get("outcome") == "held") or (
         isinstance(checks, list) and any(isinstance(check, dict) and check.get("status") == "held"
                                         for check in checks))
-    released_token = unit.get("hold_released_token")
-    released = (released_token is not None and isinstance(review, dict)
-                and released_token == review.get("token"))
-    return unit["state"] == "held" or unit.get("hold_active", False) or (previous_hold and not released)
+
+
+def held_review_key(review):
+    return review.get("token") or digest(review.get("record", review))
+
+
+def current_unit_hold(unit):
+    entries = unit.get("history", [])
+    latest, following = unit.get("review"), entries
+    for index in range(len(entries) - 1, -1, -1):
+        candidate = entries[index].get("review", entries[index])
+        if review_has_hold(candidate):
+            latest, following = candidate, entries[index + 1:]
+            break
+    if not review_has_hold(latest):
+        return None
+    key = held_review_key(latest)
+    if unit.get("hold_released_token") == key:
+        return None
+    for entry in following:
+        field = {"release_hold": "reason", "migrate_release": "evidence"}.get(entry.get("action"))
+        explanation = entry.get(field) if field else None
+        if entry.get("review_token") == key and isinstance(explanation, str) and explanation.strip():
+            return None
+    return latest
+
+
+def has_active_hold(unit):
+    return unit["state"] == "held" or unit.get("hold_active", False) or current_unit_hold(unit) is not None
 
 
 def view(state, unit):
@@ -779,12 +803,17 @@ def invalidate(state, ids, reason, *, reopen_holds=True):
     target_ids = {unit["id"] for unit in targets}
     document_hold = current_document_hold(state) if reopen_holds else None
     for unit in targets:
+        held = current_unit_hold(unit) if reopen_holds else None
         unit["generation"] += 1
         unit["state"] = "recheck"
         if reopen_holds:
             unit["hold_active"] = False
             review = unit.get("review")
-            unit["hold_released_token"] = review.get("token") if isinstance(review, dict) else None
+            unit["hold_released_token"] = (held_review_key(held) if held else
+                                           review.get("token") if isinstance(review, dict) else None)
+            if held:
+                unit["history"].append({"action": "release_hold", "review_token": held_review_key(held),
+                                        "reason": reason})
     if reopen_holds:
         for expression in state.get("expressions", {}).values():
             if set(expression["owners"]) & target_ids:
@@ -1185,6 +1214,8 @@ def reorder(state, ids):
             structure = "table headers and rows" if kind == "table_open" else "list items"
             raise RevisionError(f"keep split {structure} together in order; merge the structure before reordering its parts")
     ordered = [unit_by_id(state, uid) for uid in ids]
+    if render(state).startswith("\ufeff") and not "".join(u["text"] for u in ordered).startswith("\ufeff"):
+        raise RevisionError("keep the leading BOM at the start of the document when reordering")
     if Counter(spans) != Counter(table_and_list_spans(ordered)):
         raise RevisionError("reorder must preserve table and list boundaries")
     state["units"] = ordered
@@ -1200,6 +1231,9 @@ def blocking_issues(state):
         uid, review = unit["id"], unit.get("review")
         if unit["state"] not in TERMINAL:
             issues.append(f"{uid}: {unit['state']}")
+            continue
+        if has_active_hold(unit) and unit["state"] != "held":
+            issues.append(f"{uid}: unreleased historical hold; invalidate with new information/decision")
             continue
         if not review or review.get("token") != token(state, unit):
             issues.append(f"{uid}: missing/current-version review required")
