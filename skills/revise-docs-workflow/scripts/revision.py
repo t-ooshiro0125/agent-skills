@@ -547,7 +547,8 @@ def layout(state):
         LAYOUTS.move_to_end(key)
         return cached
     cached = {"state": state, "revision": state["revision"], "units": {}, "indices": {},
-              "headings": {}, "expressions": {}, "containers": {}}
+              "headings": {}, "expressions": {}, "containers": {},
+              "working_matches_original": state["initial_working"] == state["original"]}
     starts, ends, position = [], [], 0
     for unit in state["units"]:
         starts.append(position)
@@ -761,7 +762,8 @@ def view(state, unit):
         lines = source_lines(state["original"])
         original_text = "".join(lines[original[0] - 1:original[1]])
         original_scope = "specified_lines"
-    elif (not unit_changed(unit) and unit["initial_text"] in state["original"] and
+    elif (layout(state)["working_matches_original"] and not unit_changed(unit)
+          and unit["initial_text"] in state["original"] and
           state["original"].find(unit["initial_text"]) == state["original"].rfind(unit["initial_text"])):
         original_text, original_scope = unit["initial_text"], "matching_excerpt"
     else:

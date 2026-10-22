@@ -1436,14 +1436,33 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(shown["original_text"], "# 処理後\n\n保管する。\n\n")
 
     def test_unique_excerpt_is_shortened_but_overlapping_matches_keep_original_context(self):
-        for original, working, expected_scope in (
-                ("# 条件\n\n保管する。\n\n", "保管する。\n\n", "matching_excerpt"),
-                ("aaaa", "aaa", "whole_document")):
-            with self.subTest(expected_scope=expected_scope):
+        original = "# 条件\n\n保管する。\n\n"
+        value = revision.initialize(original, original, BRIEF)
+        shown = revision.view(value, value["units"][-1])["target"]
+        self.assertEqual(shown["original_scope"], "matching_excerpt")
+        self.assertEqual(shown["original_text"], "保管する。\n\n")
+        value = revision.initialize("aaaa", "aaaa", BRIEF)
+        unit = value["units"][0]
+        ids = revision.split_unit(value, unit["id"], revision.token(value, unit), ["aaa", "a"])
+        shown = revision.view(value, revision.unit_by_id(value, ids[0]))["target"]
+        self.assertEqual(shown["original_scope"], "whole_document")
+        self.assertEqual(shown["original_text"], "aaaa")
+
+    def test_different_initial_draft_does_not_match_an_unrelated_unique_original_paragraph(self):
+        original = "Original first.\n\nUnique second.\n\n"
+        for working in ("Unique second.\n\nUnique second.\n\n", "Unique second.\n\n"):
+            with self.subTest(working=working):
                 value = revision.initialize(original, working, BRIEF)
-                shown = revision.view(value, value["units"][0])["target"]
-                self.assertEqual(shown["original_scope"], expected_scope)
-                self.assertEqual(shown["original_text"], working if expected_scope == "matching_excerpt" else original)
+                unit = value["units"][0]
+                self.assertFalse(revision.unit_changed(unit))
+                shown = revision.view(value, unit)["target"]
+                self.assertEqual(shown["original_scope"], "whole_document")
+                self.assertEqual(shown["original_text"], original)
+                self.assertEqual(shown["initial_working_text"], "Unique second.\n\n")
+                revision.annotate(value, unit["id"], revision.token(value, unit), {"original_lines": [1, 1]})
+                shown = revision.view(value, unit)["target"]
+                self.assertEqual(shown["original_scope"], "specified_lines")
+                self.assertEqual(shown["original_text"], "Original first.\n")
 
     def test_annotation_and_review_history_survives_regrouping(self):
         value = state()
@@ -2378,6 +2397,22 @@ class ExpressionTrackingTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_cli_working_copy_uses_whole_original_until_its_source_lines_are_given(self):
+        original = "Original first.\n\nUnique second.\n\n"
+        self.original.write_text(original)
+        working = self.root / "working.md"
+        working.write_text("Unique second.\n\nUnique second.\n\n")
+        self.cli("init", "--original", self.original, "--working", working, "--brief", self.brief)
+        shown = json.loads(self.cli("next").stdout)["target"]
+        self.assertEqual(shown["original_scope"], "whole_document")
+        self.assertEqual(shown["original_text"], original)
+        annotation = self.root / "source.json"
+        annotation.write_text(json.dumps({"original_lines": [1, 1]}))
+        result = self.cli("annotate", "--unit", shown["id"], "--token", shown["token"], "--file", annotation)
+        target = json.loads(result.stdout)["target"]
+        self.assertEqual(target["original_scope"], "specified_lines")
+        self.assertEqual(target["original_text"], "Original first.\n")
+
     def test_cli_migrates_a_historical_release_after_an_old_passed_result(self):
         value, unit, held_token = legacy_released_historical_hold()
         self.assertIsNone(unit["hold_released_token"])
