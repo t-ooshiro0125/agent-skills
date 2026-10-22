@@ -358,8 +358,8 @@ def validate_expression_record(state, record, *, stored=False):
         if stored:
             if item["token"] != content_token(state, unit):
                 raise RevisionError("stale expression evidence; retrieve the text and context again")
-        else:
-            check_token(state, unit, item["token"])
+        elif item["token"] not in (content_token(state, unit), token(state, unit)):
+            raise RevisionError("stale expression evidence; retrieve the text and context again")
         start = quote_position(unit["text"], item["quote"], item.get("start"))
         normalized["evidence"].append({**item, "token": content_token(state, unit), "start": start})
     return normalized
@@ -624,6 +624,7 @@ def view(state, unit):
     else:
         original_text, original_scope = state["original"], "whole_document"
     return {"target": {"id": unit["id"], "kind": unit["kind"], "token": token(state, unit),
+                       "content_token": content_token(state, unit),
                        "text": unit["text"], "initial_working_text": unit["initial_text"],
                        "original_text": original_text, "original_scope": original_scope,
                        "state": unit["state"], "hold_active": unit_has_hold(state, unit),
@@ -749,6 +750,7 @@ def edit(state, uid, expected, text, affected=(), all_affected=False):
     impacted = [unit_by_id(state, item) for item in affected]
     unit["history"].append({"action": "edit", "text": unit["text"], "token": expected})
     unit["text"], unit["state"], unit["awaiting_review"] = text, "recheck", True
+    unit["generation"] += 1
     if all_affected:
         impacted = state["units"]
     for other in impacted:
