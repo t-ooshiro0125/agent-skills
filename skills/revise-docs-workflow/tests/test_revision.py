@@ -2,6 +2,7 @@ import copy
 import importlib.util
 import json
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -139,6 +140,21 @@ class SegmentationTests(unittest.TestCase):
         self.assertIn(ids[0], last["context_ids"])
         with self.assertRaises(revision.RevisionError):
             revision.split_unit(value, last["id"], revision.token(value, last), ["| y", " | 2 |\n"])
+
+    def test_quoted_fences_cannot_be_split_even_inside_merged_targets(self):
+        for prefix, marker in (("> ", TICKS), ("> > ", "~~~")):
+            with self.subTest(prefix=prefix):
+                code = prefix + marker + "sh\n" + prefix + "a\n" + prefix + "b\n" + prefix + marker + "\n\n"
+                value = state(code + "後続の段落。\n")
+                uid = revision.merge_units(value, [u["id"] for u in value["units"]])
+                unit = revision.unit_by_id(value, uid)
+                cut = code.index(prefix + "b")
+                with self.assertRaises(revision.RevisionError):
+                    revision.split_unit(value, uid, revision.token(value, unit),
+                                        [unit["text"][:cut], unit["text"][cut:]])
+                revision.split_unit(value, uid, revision.token(value, unit),
+                                    [code, "後続の段落。\n"])
+                self.assertEqual(revision.render(value), value["original"])
 
     def test_reorder_requires_complete_permutation_and_invalidates_all(self):
         value = state()
@@ -364,6 +380,48 @@ class CliTests(unittest.TestCase):
         self.cli("split", "--unit", target["id"], "--token", target["token"], "--file", parts,
                  success=False)
         self.assertEqual(self.path.read_bytes(), before)
+
+    def test_finish_preserves_existing_file_mode(self):
+        self.cli("init", "--original", self.original, "--brief", self.brief)
+        value = revision.load(self.path)
+        accept_all(value)
+        final(value)
+        revision.save(self.path, value)
+        output = self.root / "output.md"
+        output.write_text("旧文書")
+        output.chmod(0o644)
+        self.cli("finish", "--output", output)
+        self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o644)
+        self.assertEqual(output.read_bytes(), self.original.read_bytes())
+
+    def test_finish_rejects_symlinks_without_replacing_link_or_other_outputs(self):
+        self.cli("init", "--original", self.original, "--brief", self.brief)
+        value = revision.load(self.path)
+        accept_all(value)
+        final(value)
+        revision.save(self.path, value)
+        target = self.root / "target.md"
+        target.write_text("リンク先の文書")
+        output = self.root / "linked.md"
+        output.symlink_to(target)
+        self.cli("finish", "--output", output, success=False)
+        self.assertTrue(output.is_symlink())
+        self.assertEqual(target.read_text(), "リンク先の文書")
+        normal = self.root / "normal.md"
+        normal.write_text("既存文書")
+        self.cli("finish", "--output", normal, "--report", output, success=False)
+        self.assertEqual(normal.read_text(), "既存文書")
+        self.assertTrue(output.is_symlink())
+        with self.assertRaises(revision.RevisionError):
+            revision.write_atomic(output, "置換しない")
+        backing = self.root / "backing-state.json"
+        self.path.rename(backing)
+        self.path.symlink_to(backing)
+        before = backing.read_bytes()
+        self.cli("finish", "--output", normal, success=False)
+        self.assertTrue(self.path.is_symlink())
+        self.assertEqual(backing.read_bytes(), before)
+        self.assertEqual(normal.read_text(), "既存文書")
 
 
 if __name__ == "__main__":

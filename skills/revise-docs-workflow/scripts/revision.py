@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import tempfile
 
@@ -41,12 +42,18 @@ def read_json(path):
 
 def write_atomic(path, text):
     path = Path(path)
+    if path.is_symlink():
+        raise RevisionError("refusing to replace a symbolic link; specify the intended regular file")
+    mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else None
     path.parent.mkdir(parents=True, exist_ok=True)
     name = None
     try:
         with tempfile.NamedTemporaryFile("wb", dir=path.parent, delete=False) as stream:
             name = stream.name
             stream.write(text.encode("utf-8"))
+            stream.flush()
+            if mode is not None:
+                os.fchmod(stream.fileno(), mode)
         os.replace(name, path)
     finally:
         if name and os.path.exists(name):
@@ -230,6 +237,8 @@ def validate_state(state):
 
 
 def load(path):
+    if Path(path).is_symlink():
+        raise RevisionError("state must be a regular file, not a symbolic link")
     state = read_json(path)
     validate_state(state)
     return state
@@ -430,13 +439,21 @@ def safe_cuts(text, cuts, kind):
         offset = end
     offset = 0
     lines = text.splitlines(keepends=True)
+    unquoted = []
+    for line in lines:
+        # A fence may be nested in one or more blockquotes.
+        prefix = re.match(r"^ {0,3}>[ \t]?", line)
+        while prefix:
+            line = line[prefix.end():]
+            prefix = re.match(r"^ {0,3}>[ \t]?", line)
+        unquoted.append(line)
     i = 0
     while i < len(lines):
-        if FENCE.match(lines[i].lstrip()):
+        if FENCE.match(unquoted[i].lstrip()):
             # Lists can contain indented fences which must also stay whole.
-            indent = len(lines[i]) - len(lines[i].lstrip())
+            indent = len(unquoted[i]) - len(unquoted[i].lstrip())
             normalized = [line[indent:] if line.startswith(" " * indent) else line
-                          for line in lines]
+                          for line in unquoted]
             end = fence_end(normalized, i)
             bound = offset + sum(len(s) for s in lines[i:end])
             if any(offset < cut < bound for cut in cuts):
@@ -683,6 +700,8 @@ def main(argv=None):
                 result = status(state)
             elif command == "finish":
                 outputs = [args.output] + ([args.report] if args.report else [])
+                if any(path.is_symlink() for path in outputs + [args.state]):
+                    raise RevisionError("refusing symbolic-link output/state paths; specify regular files")
                 if len({p.resolve() for p in outputs + [args.state]}) != len(outputs) + 1:
                     raise RevisionError("output, report, and state paths must be distinct")
                 result = finish(state)
