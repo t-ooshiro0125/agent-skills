@@ -242,7 +242,8 @@ def update_brief(state, brief):
         return
     state["events"].append({"reason": "previous brief", "brief": copy.deepcopy(state["brief"])})
     state["brief"] = copy.deepcopy(brief)
-    invalidate(state, [u["id"] for u in state["units"]], "document brief/criteria changed")
+    invalidate(state, [u["id"] for u in state["units"]], "document brief/criteria changed",
+               reopen_holds=False)
 
 
 def extend_limit(state, maximum, reason):
@@ -488,13 +489,14 @@ def annotate(state, uid, expected, data):
     touch(state, f"annotate {uid}")
 
 
-def invalidate(state, ids, reason):
+def invalidate(state, ids, reason, *, reopen_holds=True):
     require_text(reason, "invalidation reason")
     targets = [unit_by_id(state, uid) for uid in ids]
     for unit in targets:
         unit["generation"] += 1
         unit["state"] = "recheck"
-        unit["hold_active"] = False
+        if reopen_holds:
+            unit["hold_active"] = False
     touch(state, reason)
 
 

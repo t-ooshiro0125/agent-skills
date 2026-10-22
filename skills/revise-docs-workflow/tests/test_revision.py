@@ -542,6 +542,28 @@ class ReviewTests(unittest.TestCase):
                 revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit))
                 self.assertFalse(revision.has_active_hold(unit))
 
+    def test_reader_or_criteria_changes_do_not_reopen_a_hold(self):
+        for change in ("reader", "reader_difficulties", "criteria"):
+            with self.subTest(change=change):
+                value = state("対象。\n")
+                unit = value["units"][0]
+                revision.record_review(value, unit["id"], revision.token(value, unit), hold())
+                brief = copy.deepcopy(value["brief"])
+                if change == "criteria":
+                    brief["criteria"][0]["description"] = "元の条件と留保を保持する"
+                else:
+                    brief[change] += "。用語の意味も確認する"
+                revision.update_brief(value, brief)
+                self.assertEqual(unit["state"], "recheck")
+                self.assertTrue(revision.has_active_hold(unit))
+                before = copy.deepcopy(value)
+                with self.assertRaisesRegex(revision.RevisionError, "held.*invalidate"):
+                    revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit))
+                self.assertEqual(value, before)
+                revision.invalidate(value, [unit["id"]], "保留の原因となった情報と判断が得られた")
+                revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit))
+                self.assertFalse(revision.has_active_hold(unit))
+
     def test_regrouping_does_not_turn_edited_text_into_unchanged(self):
         value = state()
         unit = value["units"][0]
