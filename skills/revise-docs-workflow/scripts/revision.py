@@ -226,6 +226,8 @@ def refresh(state):
 
 
 def validate_state(state):
+    if not isinstance(state, dict):
+        raise RevisionError("state must be an object")
     if state.get("format") != 1 or digest(state["original"]) != state["original_hash"]:
         raise RevisionError("unsupported state or modified original snapshot")
     validate_brief(state["brief"])

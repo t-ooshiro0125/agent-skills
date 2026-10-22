@@ -493,6 +493,16 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("Traceback", result.stderr)
         self.assertFalse(self.path.exists())
 
+    def test_non_object_state_is_rejected_without_rewriting_input(self):
+        for invalid in ([], "text", None, 42, True):
+            with self.subTest(value=invalid):
+                self.path.write_text(json.dumps(invalid))
+                before = self.path.read_bytes()
+                result = self.cli("status", success=False)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertIn("state must be an object", result.stderr)
+                self.assertEqual(self.path.read_bytes(), before)
+
     def test_cli_roundtrip_and_failed_finish_leaves_output_untouched(self):
         self.cli("init", "--original", self.original, "--brief", self.brief)
         output = self.root / "output.md"
