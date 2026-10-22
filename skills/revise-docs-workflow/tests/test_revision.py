@@ -100,6 +100,57 @@ def final(value):
 
 
 class SegmentationTests(unittest.TestCase):
+    def test_leading_bom_preserves_structure_context_and_source_offsets(self):
+        for text, kind in (("\ufeff# 題名\r\n\r\n説明。\r\n", "heading"),
+                           ("\ufeff題名\n====\n\n説明。\n", "heading"),
+                           ("\ufeff" + TICKS + "sh\necho test\n" + TICKS + "\n", "code"),
+                           ("\ufeff- first\n- second\n", "list"),
+                           ("\ufeff| A |\n| --- |\n| x |\n", "table")):
+            with self.subTest(text=text):
+                value = state(text)
+                first = value["units"][0]
+                self.assertEqual(first["kind"], kind)
+                self.assertTrue(first["text"].startswith("\ufeff"))
+                self.assertEqual(revision.render(value).encode(), text.encode())
+                self.assertEqual(value["original_hash"], revision.digest(text))
+                self.assertEqual(revision.view(value, first)["target"]["original_text"], first["text"])
+                if kind == "heading":
+                    following = value["units"][-1]
+                    headings = revision.view(value, following)["reference_only"]["headings"]
+                    self.assertEqual(headings[0]["text"], first["text"])
+                    before = copy.deepcopy(value)
+                    cut = first["text"].index("題名") + 1
+                    with self.assertRaisesRegex(revision.RevisionError, "headings"):
+                        revision.split_unit(value, first["id"], revision.token(value, first),
+                                            [first["text"][:cut], first["text"][cut:]])
+                    self.assertEqual(value, before)
+                accept_all(value)
+                final(value)
+                self.assertEqual(revision.finish(value)["text"].encode(), text.encode())
+
+    def test_bom_inline_checks_keep_raw_quote_positions_and_nonleading_bom(self):
+        text = "\ufeff前 `--option` 後。\n"
+        value = state(text)
+        unit = value["units"][0]
+        start = text.index("--option")
+        revision.register_expressions(value, unit["id"], revision.token(value, unit), [
+            {"id": "option", "quote": "--option", "origin": "inspection", "goal": "指定する引数が分かる"}])
+        self.assertEqual(value["expressions"]["option"]["source"]["start"], start)
+        with self.assertRaisesRegex(revision.RevisionError, "inline Markdown"):
+            revision.split_unit(value, unit["id"], revision.token(value, unit), [text[:start + 3], text[start + 3:]])
+        token = revision.view(value, unit)["target"]["content_token"]
+        expression = value["expressions"]["option"]
+        revision.record_expression(value, "option", revision.expression_version(value, expression), {
+            "outcome": "explained", "observation": "指定する引数を本文で確認した",
+            "evidence": [{"unit_id": unit["id"], "token": token, "quote": "--option"}]})
+        self.assertEqual(expression["review"]["record"]["evidence"][0]["start"], start)
+        accept_all(value)
+        final(value)
+        self.assertEqual(revision.finish(value)["text"], text)
+        embedded = "前\ufeff# 通常の文章。\n"
+        inline = next(n for n in revision.syntax(embedded) if n.type == "inline")
+        self.assertEqual(inline.content, embedded.rstrip("\n"))
+
     def test_inline_markdown_cannot_be_split_inside_its_syntax(self):
         for markup in ("`--option`", "``a`b``", "`a\nb`", "[案内](https://example.test/path)",
                        "![図](https://example.test/image)", "<https://example.test/path>",
@@ -1158,6 +1209,66 @@ class CriterionWorkflowTests(unittest.TestCase):
         revision.final_review(value, revision.document_token(value), passed)
         self.assertTrue(revision.finish(value)["fully_resolved"])
 
+    def test_document_hold_survives_metadata_changes_and_release_is_bound_to_that_hold(self):
+        for change in ("limit", "plan", "brief", "expression"):
+            with self.subTest(change=change):
+                value = state("用語A。\n", limit=6)
+                unit = value["units"][0]
+                revision.register_expressions(value, unit["id"], revision.token(value, unit), [
+                    {"id": "a", "quote": "用語A", "origin": "inspection", "goal": "Aの意味が分かる"}])
+                expression = value["expressions"]["a"]
+                def check_expression():
+                    revision.record_expression(value, "a", revision.expression_version(value, expression), {
+                        "outcome": "explained", "observation": "Aの意味を本文で確認した",
+                        "evidence": [{"unit_id": unit["id"], "token": revision.content_token(value, unit),
+                                      "quote": "用語A"}]})
+                check_expression()
+                accept_all(value)
+                ensure_plan(value)
+                held = {"original_comparison": "原文の対象は保持されている",
+                        "standalone_read": "説明順序には判断待ちが残る",
+                        "checks": result_for(value, outcome="held")["checks"]}
+                revision.final_review(value, revision.document_token(value), held)
+                old = revision.document_token(value)
+                if change == "limit":
+                    revision.extend_limit(value, 8, "追加の確認に必要な反復上限を増やす")
+                elif change == "plan":
+                    plan = copy.deepcopy(value["document_plan"])
+                    plan["proposal"] = "説明の順序を追加で点検する"
+                    revision.set_plan(value, None, old, plan)
+                elif change == "brief":
+                    brief = copy.deepcopy(value["brief"])
+                    brief["reader"] = "初めて利用する担当者"
+                    revision.update_brief(value, brief)
+                    check_expression()
+                else:
+                    check_expression()
+                self.assertNotEqual(revision.document_token(value), old)
+                self.assertTrue(revision.status(value)["document_hold_active"])
+                self.assertEqual(revision.status(value)["document_hold"]["record"], held)
+                accept_all(value)
+                passed = {**held, "checks": result_for(value)["checks"]}
+                with self.assertRaisesRegex(revision.RevisionError, "held document"):
+                    revision.final_review(value, revision.document_token(value), passed)
+                before = copy.deepcopy(value)
+                with self.assertRaises(revision.RevisionError):
+                    revision.invalidate(value, [], "対象を指定していない")
+                self.assertEqual(value, before)
+                revision.invalidate(value, [unit["id"]], "保留していた説明順序の方針が確定した")
+                release = value["document_history"][-1]
+                self.assertEqual(release["action"], "release_hold")
+                self.assertEqual(release["review_token"], old)
+                self.assertFalse(revision.status(value)["document_hold_active"])
+                check_expression()
+                accept_all(value)
+                revision.final_review(value, revision.document_token(value), passed)
+                self.assertTrue(revision.finish(value)["fully_resolved"])
+                later = {**held, "checks": result_for(value, outcome="held")["checks"]}
+                revision.final_review(value, revision.document_token(value), later)
+                self.assertTrue(revision.status(value)["document_hold_active"])
+                with self.assertRaisesRegex(revision.RevisionError, "held document"):
+                    revision.final_review(value, revision.document_token(value), passed)
+
     def test_results_are_not_derived_from_changed_text_or_plan(self):
         value = state("対象。\n")
         unit = value["units"][0]
@@ -1576,6 +1687,39 @@ class CliTests(unittest.TestCase):
                                  *map(str, args)], capture_output=True, text=True, umask=umask)
         self.assertEqual(result.returncode, 0 if success else 1, result.stderr)
         return result
+
+    def test_cli_document_hold_survives_limit_extension_and_reload_until_explicit_invalidation(self):
+        value = state("対象。\n", limit=5)
+        accept_all(value)
+        ensure_plan(value)
+        held = {"original_comparison": "原文の対象を保持している",
+                "standalone_read": "説明順序の方針確認が残る",
+                "checks": result_for(value, outcome="held")["checks"]}
+        revision.final_review(value, revision.document_token(value), held)
+        revision.save(self.path, value)
+        extended = json.loads(self.cli("extend-limit", "--max-iterations", 7,
+                                       "--reason", "確認に必要な上限を増やす").stdout)
+        self.assertTrue(extended["document_hold_active"])
+        self.assertEqual(extended["document_hold"]["record"], held)
+        passed = {**held, "checks": result_for(value)["checks"]}
+        result_path = self.root / "final.json"
+        result_path.write_text(json.dumps(passed))
+        before = self.path.read_bytes()
+        self.cli("final-review", "--token", extended["document_token"], "--file", result_path, success=False)
+        self.assertEqual(self.path.read_bytes(), before)
+        unit = value["units"][0]
+        released = json.loads(self.cli("invalidate", "--units", unit["id"],
+                                      "--reason", "保留していた方針の判断が得られた").stdout)
+        self.assertFalse(released["document_hold_active"])
+        self.cli("final-review", "--token", released["document_token"], "--file", result_path, success=False)
+        current = revision.load(self.path)
+        aggregate = self.root / "unit.json"
+        aggregate.write_text(json.dumps(result_for(current, current["units"][0])))
+        self.cli("record", "--unit", unit["id"], "--token", revision.token(current, current["units"][0]),
+                 "--file", aggregate)
+        current = revision.load(self.path)
+        self.cli("final-review", "--token", revision.document_token(current), "--file", result_path)
+        self.assertTrue(revision.finish(revision.load(self.path))["fully_resolved"])
 
     def test_cli_rejects_held_document_overwrite_inline_split_and_list_reorder_without_saving(self):
         value = state("対象。\n")

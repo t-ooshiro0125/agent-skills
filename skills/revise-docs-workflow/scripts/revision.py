@@ -36,9 +36,14 @@ def source_lines(text):
     return re.findall(r"[^\r\n]*(?:\r\n|\r|\n|$)", text)[:-1]
 
 
+def markdown_source(text):
+    # Only parser input drops the leading BOM; source slices and offsets stay raw.
+    return text.removeprefix("\ufeff")
+
+
 @lru_cache(maxsize=128)
 def syntax(text):
-    return tuple(MARKDOWN.parse(text))
+    return tuple(MARKDOWN.parse(markdown_source(text)))
 
 
 def digest(value):
@@ -655,9 +660,11 @@ def history(state, uid):
 
 def status(state):
     refresh(state)
+    document_hold = current_document_hold(state)
     return {"document_token": document_token(state), "revision": state["revision"],
             "max_iterations": state["max_iterations"],
             "document_plan": state["document_plan"],
+            "document_hold_active": bool(document_hold), "document_hold": copy.deepcopy(document_hold),
             "document_criteria": criteria_for(state, "document", state["document_plan"]),
             "expressions": [expression_view(state, e) for e in state.get("expressions", {}).values()],
             "counts": dict(Counter(u["state"] for u in state["units"])),
@@ -719,7 +726,10 @@ def annotate(state, uid, expected, data):
 def invalidate(state, ids, reason, *, reopen_holds=True):
     require_text(reason, "invalidation reason")
     targets = [unit_by_id(state, uid) for uid in ids]
+    if not targets and state["units"]:
+        raise RevisionError("invalidate requires at least one affected target")
     target_ids = {unit["id"] for unit in targets}
+    document_hold = current_document_hold(state) if reopen_holds else None
     for unit in targets:
         unit["generation"] += 1
         unit["state"] = "recheck"
@@ -733,6 +743,9 @@ def invalidate(state, ids, reason, *, reopen_holds=True):
                 expression["hold_active"] = False
                 review = expression["review"]
                 expression["hold_released_version"] = review["version"] if review else None
+        if document_hold:
+            state["document_history"].append({"action": "release_hold", "review_token": document_hold["token"],
+                                              "reason": reason})
     touch(state, reason)
 
 
@@ -857,7 +870,7 @@ def inline_signature(parts, environment):
     """Compare inline syntax without treating plain-text split boundaries as changes."""
     result = []
     for part in parts:
-        for node in SPLIT_MARKDOWN.parse(part, copy.deepcopy(environment)):
+        for node in SPLIT_MARKDOWN.parse(markdown_source(part), copy.deepcopy(environment)):
             if node.type != "inline":
                 continue
             for child in node.children or []:
@@ -884,7 +897,7 @@ def safe_cuts(text, cuts, kind, environment):
         offsets.append(offsets[-1] + len(line))
     line_starts = {offset: index for index, offset in enumerate(offsets)}
     quoted = []
-    for node in SPLIT_MARKDOWN.parse(text, copy.deepcopy(environment)):
+    for node in SPLIT_MARKDOWN.parse(markdown_source(text), copy.deepcopy(environment)):
         if node.map is None:
             continue
         first, last = node.map
@@ -970,7 +983,7 @@ def split_unit(state, uid, expected, parts):
         offset += len(part)
         cuts.append(offset)
     environment = {}
-    MARKDOWN.parse(render(state), environment)
+    MARKDOWN.parse(markdown_source(render(state)), environment)
     safe_cuts(unit["text"], cuts, unit["kind"], environment)
     children = []
     position = state["units"].index(unit)
@@ -1115,10 +1128,14 @@ def validate_final_record(state, record):
 
 
 def current_document_hold(state):
-    expected = document_token(state)
-    records = [state["final_review"], *reversed(state["document_history"])]
-    return next((record for record in records if record and record.get("token") == expected
-                 and any(check["status"] == "held" for check in record["record"]["checks"])), None)
+    records = [*reversed(state["document_history"]), state["final_review"]]
+    latest = next((record for record in records if record and "record" in record
+                   and any(check["status"] == "held" for check in record["record"]["checks"])), None)
+    if latest and not any(entry.get("action") == "release_hold" and entry["review_token"] == latest["token"]
+                          and isinstance(entry.get("reason"), str) and entry["reason"].strip()
+                          for entry in state["document_history"]):
+        return latest
+    return None
 
 
 def final_review(state, expected, record):
