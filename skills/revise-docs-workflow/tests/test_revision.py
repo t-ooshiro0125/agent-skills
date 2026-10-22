@@ -100,6 +100,66 @@ def final(value):
 
 
 class SegmentationTests(unittest.TestCase):
+    def test_edit_preserves_split_table_rows_and_list_items(self):
+        cases = [
+            (["| A | B |\n| --- | --- |\n", "| x | 1 |\n", "| y | 2 |\n"],
+             ["| x | 1 | extra |\n", "paragraph\n", ""], "| x revised | 1 |\n"),
+            (["- first\n", "- second\n", "- third\n"],
+             ["second\n", "", "- second\n- extra\n"], "- revised second\n"),
+            (["> 1. first\n", "> 2. second\n", "> 3. third\n"],
+             ["> second\n", "second\n", ""], "> 2. revised second\n"),
+        ]
+        for parts, invalid, valid in cases:
+            for replacement in invalid + [valid]:
+                with self.subTest(parts=parts, replacement=replacement):
+                    value = state("".join(parts))
+                    whole = value["units"][0]
+                    ids = revision.split_unit(value, whole["id"], revision.token(value, whole), parts)
+                    unit = revision.unit_by_id(value, ids[1])
+                    ensure_plan(value, unit)
+                    before = copy.deepcopy(value)
+                    if replacement == valid:
+                        revision.edit(value, unit["id"], revision.token(value, unit), replacement)
+                        self.assertEqual(revision.render(value), parts[0] + valid + parts[2])
+                        for current in value["units"]:
+                            ensure_plan(value, current)
+                            outcome = "confirmed" if current is unit else "unchanged"
+                            revision.record_review(value, current["id"], revision.token(value, current),
+                                                   result_for(value, current, outcome))
+                        final(value)
+                        self.assertTrue(revision.finish(value)["fully_resolved"])
+                    else:
+                        with self.assertRaisesRegex(revision.RevisionError, "split table/list structure"):
+                            revision.edit(value, unit["id"], revision.token(value, unit), replacement)
+                        self.assertEqual(value, before)
+
+    def test_structure_changes_are_allowed_after_merging_the_whole_structure(self):
+        value = state("- first\n- second\n")
+        whole = value["units"][0]
+        ids = revision.split_unit(value, whole["id"], revision.token(value, whole),
+                                  ["- first\n", "- second\n"])
+        uid = revision.merge_units(value, ids)
+        unit = revision.unit_by_id(value, uid)
+        ensure_plan(value, unit)
+        revision.edit(value, uid, revision.token(value, unit), "first and second\n")
+        self.assertEqual(revision.render(value), "first and second\n")
+
+    def test_heading_context_is_built_once_for_documents_larger_than_the_syntax_cache(self):
+        text = "# Heading\n\n" + "\n\n".join(f"Paragraph {i}." for i in range(300)) + "\n"
+        value = revision.initialize(text, text, BRIEF)
+        with patch.object(revision, "blocks", wraps=revision.blocks) as parsed:
+            revision.document_token(value)
+            revision.status(value)
+            revision.document_token(value)
+            self.assertEqual(parsed.call_count, len(value["units"]))
+        heading, following = value["units"][:2]
+        ensure_plan(value, heading)
+        revision.edit(value, heading["id"], revision.token(value, heading), "# Revised heading\n\n")
+        view = revision.context(value, following)
+        self.assertEqual(view["headings"], [{"level": 1, "text": "# Revised heading\n\n"}])
+        view["headings"][0]["text"] = "changed by caller"
+        self.assertEqual(revision.context(value, following)["headings"][0]["text"], "# Revised heading\n\n")
+
     def test_leading_bom_preserves_structure_context_and_source_offsets(self):
         for text, kind in (("\ufeff# 題名\r\n\r\n説明。\r\n", "heading"),
                            ("\ufeff題名\n====\n\n説明。\n", "heading"),
@@ -982,6 +1042,32 @@ class ReviewTests(unittest.TestCase):
 
 
 class CriterionWorkflowTests(unittest.TestCase):
+    def test_returning_to_old_plan_or_annotation_does_not_restore_old_results(self):
+        for change in ("plan", "annotation"):
+            with self.subTest(change=change):
+                value = state("対象と条件。\n")
+                unit = value["units"][0]
+                if change == "annotation":
+                    revision.annotate(value, unit["id"], revision.token(value, unit), {"context_note": "A"})
+                old = revision.token(value, unit)
+                record = result_for(value, unit)
+                revision.record_review(value, unit["id"], old, record)
+                if change == "plan":
+                    original = copy.deepcopy(unit["plan"])
+                    revised = {**original, "proposal": "別の説明順を検討する"}
+                    for plan in (revised, original):
+                        revision.set_plan(value, unit["id"], revision.token(value, unit), plan)
+                else:
+                    for note in ("B", "A"):
+                        revision.annotate(value, unit["id"], revision.token(value, unit), {"context_note": note})
+                self.assertNotEqual(revision.token(value, unit), old)
+                with self.assertRaisesRegex(revision.RevisionError, "stale unit token"):
+                    revision.record_review(value, unit["id"], old, record)
+                self.assertEqual(unit["state"], "recheck")
+                accept_all(value)
+                final(value)
+                self.assertTrue(revision.finish(value)["fully_resolved"])
+
     def test_reader_difficulties_goals_and_registered_criteria_are_presented(self):
         value = state("確認する対象。\n")
         shown = revision.next_target(value)
@@ -1354,6 +1440,30 @@ class CriterionWorkflowTests(unittest.TestCase):
 
 
 class ExpressionTrackingTests(unittest.TestCase):
+    def test_returning_to_old_goal_rejects_old_version_and_old_content_evidence(self):
+        value = state("用語A。\n")
+        unit = value["units"][0]
+        expression = self.register(value)
+        old = revision.expression_version(value, expression)
+        evidence = self.explanation(value)
+        evidence["evidence"][0]["token"] = revision.content_token(value, unit)
+        self.check(value, expression, evidence)
+        goal = expression["goal"]
+        for replacement in ("Aを使う条件が分かる", goal):
+            revision.change_expression_goal(value, expression["id"],
+                                            revision.expression_version(value, expression), replacement)
+        current = revision.expression_version(value, expression)
+        self.assertNotEqual(current, old)
+        self.assertFalse(revision.expression_review_current(value, expression))
+        with self.assertRaisesRegex(revision.RevisionError, "stale expression version"):
+            revision.record_expression(value, expression["id"], old, evidence)
+        with self.assertRaises(revision.RevisionError):
+            revision.record_expression(value, expression["id"], current, evidence)
+        self.check(value, expression)
+        accept_all(value)
+        final(value)
+        self.assertTrue(revision.finish(value)["fully_resolved"])
+
     def register(self, value, unit=None, entries=None):
         unit = unit or value["units"][0]
         entries = entries or [{"id": "term_a", "quote": "用語A", "origin": "inspection",
@@ -2208,6 +2318,31 @@ class CliTests(unittest.TestCase):
         self.cli("finish", "--output", output, "--report", report, umask=0o077)
         self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o644)
         self.assertEqual(stat.S_IMODE(report.stat().st_mode), 0o640)
+
+    def test_staged_content_is_private_until_final_permissions_are_applied(self):
+        for existing in (False, True):
+            with self.subTest(existing=existing):
+                output = self.root / f"private-{existing}.md"
+                if existing:
+                    output.write_text("private original")
+                    output.chmod(0o600)
+                fdopen = revision.os.fdopen
+                observed = []
+
+                def inspect_before_write(descriptor, mode):
+                    observed.append(stat.S_IMODE(revision.os.fstat(descriptor).st_mode))
+                    self.assertEqual(revision.os.fstat(descriptor).st_size, 0)
+                    return fdopen(descriptor, mode)
+
+                with patch.object(revision.os, "fdopen", side_effect=inspect_before_write):
+                    staged = revision.stage_file(output, b"private revised content", new_mode=0o666)
+                try:
+                    self.assertEqual(observed, [0o600])
+                    self.assertEqual(Path(staged).read_bytes(), b"private revised content")
+                    if existing:
+                        self.assertEqual(stat.S_IMODE(Path(staged).stat().st_mode), 0o600)
+                finally:
+                    Path(staged).unlink()
 
     def test_temporary_name_collision_does_not_remove_the_existing_file(self):
         existing = self.root / ".revision-collision.tmp"

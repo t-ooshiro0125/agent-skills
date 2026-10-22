@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Keep local, versioned editing records; never call a model or judge prose."""
 import argparse
-from collections import Counter
+from bisect import bisect_left, bisect_right
+from collections import Counter, OrderedDict
 from functools import lru_cache
 import copy
 import hashlib
@@ -11,6 +12,7 @@ from pathlib import Path
 import re
 import secrets
 import stat
+import subprocess
 import sys
 
 
@@ -29,6 +31,7 @@ TERMINAL = {"confirmed", "unchanged", "held"}
 OPAQUE = {"ok", "okay", "問題なし", "確認済み", "完了", "変更なし", "修正済み"}
 MARKDOWN = MarkdownIt("commonmark").enable("table")
 SPLIT_MARKDOWN = MarkdownIt("commonmark", {"inline_definitions": True}).enable("table")
+LAYOUTS = OrderedDict()
 
 
 def source_lines(text):
@@ -66,18 +69,23 @@ def stage_file(path, data, *, new_mode=0o600):
         raise RevisionError("refusing to replace a symbolic link; specify the intended regular file")
     if path.exists() and not path.is_file():
         raise RevisionError(f"destination must be a regular file: {path}")
-    mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else None
+    if path.exists():
+        mode = stat.S_IMODE(path.stat().st_mode)
+    else:
+        # Read the inherited umask in a child without changing the parent's mask.
+        mask = int(subprocess.check_output(
+            [sys.executable, "-I", "-S", "-B", "-c", "import os; print(os.umask(0))"], text=True))
+        mode = new_mode & ~mask
     path.parent.mkdir(parents=True, exist_ok=True)
     name = None
     try:
         candidate = path.parent / f".revision-{secrets.token_hex(16)}.tmp"
-        descriptor = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, new_mode)
+        descriptor = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         name = str(candidate)
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(data)
             stream.flush()
-            if mode is not None:
-                os.fchmod(stream.fileno(), mode)
+            os.fchmod(stream.fileno(), mode)
         return name
     except BaseException:
         if name and os.path.exists(name):
@@ -232,6 +240,7 @@ def set_plan(state, uid, expected, data):
     if unit:
         unit["plan"] = copy.deepcopy(data)
         unit["history"].append(entry)
+        unit["generation"] += 1
     else:
         state["document_plan"] = copy.deepcopy(data)
         state["document_history"].append(entry)
@@ -268,7 +277,7 @@ def expression_definition(expression):
 
 
 def expressions_for(state, unit):
-    return [e for e in state.get("expressions", {}).values() if unit["id"] in e["owners"]]
+    return layout(state)["expressions"].get(unit["id"], [])
 
 
 def quote_position(text, quote, start=None):
@@ -417,6 +426,8 @@ def change_expression_goal(state, eid, expected, goal):
     if goal != expression["goal"]:
         expression["history"].append({"action": "previous_goal", "goal": expression["goal"]})
         expression["goal"] = goal
+        for uid in expression["owners"]:
+            unit_by_id(state, uid)["generation"] += 1
         touch(state, f"expression goal changed: {eid}")
 
 
@@ -478,11 +489,40 @@ def upgrade(state, brief, max_iterations=None):
     return result
 
 
+def layout(state):
+    """Build heading stacks and lookups once per document revision."""
+    key = id(state)
+    cached = LAYOUTS.get(key)
+    if cached is not None and cached["state"] is state and cached["revision"] == state["revision"]:
+        LAYOUTS.move_to_end(key)
+        return cached
+    cached = {"state": state, "revision": state["revision"], "units": {}, "indices": {},
+              "headings": {}, "expressions": {}}
+    headings = []
+    for index, unit in enumerate(state["units"]):
+        uid = unit["id"]
+        cached["units"][uid], cached["indices"][uid] = unit, index
+        cached["headings"][uid] = list(headings)
+        for block in blocks(unit["text"]):
+            if block["kind"] == "heading":
+                level = block["level"]
+                headings = [h for h in headings if h["level"] < level]
+                headings.append({"level": level, "text": block["text"]})
+    for expression in state.get("expressions", {}).values():
+        for uid in expression["owners"]:
+            cached["expressions"].setdefault(uid, []).append(expression)
+    LAYOUTS[key] = cached
+    LAYOUTS.move_to_end(key)
+    while len(LAYOUTS) > 8:
+        LAYOUTS.popitem(last=False)
+    return cached
+
+
 def unit_by_id(state, uid):
-    for unit in state["units"]:
-        if unit["id"] == uid:
-            return unit
-    raise RevisionError(f"unknown active unit: {uid}")
+    try:
+        return layout(state)["units"][uid]
+    except KeyError:
+        raise RevisionError(f"unknown active unit: {uid}") from None
 
 
 def render(state):
@@ -491,15 +531,9 @@ def render(state):
 
 def context(state, unit):
     units = state["units"]
-    index = units.index(unit)
-    headings = []
-    for previous in units[:index]:
-        for block in blocks(previous["text"]):
-            if block["kind"] != "heading":
-                continue
-            level = block["level"]
-            headings = [h for h in headings if h["level"] < level]
-            headings.append({"level": level, "text": block["text"]})
+    current = layout(state)
+    index = current["indices"][unit["id"]]
+    headings = copy.deepcopy(current["headings"][unit["id"]])
     refs = [{"id": uid, "text": unit_by_id(state, uid)["text"]} for uid in unit["context_ids"]]
     result = {"brief": state["brief"], "headings": headings,
             "before": units[index - 1]["text"] if index else "",
@@ -539,6 +573,7 @@ def refresh(state):
 def validate_state(state):
     if not isinstance(state, dict):
         raise RevisionError("state must be an object")
+    LAYOUTS.pop(id(state), None)
     if state.get("format") != 2:
         raise RevisionError("unsupported state format; upgrade format 1 with a new brief and registered criteria")
     if digest(state["original"]) != state["original_hash"]:
@@ -720,6 +755,7 @@ def annotate(state, uid, expected, data):
     unit["context_ids"] = list(dict.fromkeys(refs))
     unit["history"].append({"action": "annotate", "notes": copy.deepcopy(unit["notes"])})
     unit["notes"].update({k: copy.deepcopy(v) for k, v in data.items() if k != "context_ids"})
+    unit["generation"] += 1
     touch(state, f"annotate {uid}")
 
 
@@ -762,6 +798,9 @@ def edit(state, uid, expected, text, affected=(), all_affected=False):
     if unit["awaiting_review"]:
         raise RevisionError("record the check of the last edit before editing again")
     impacted = [unit_by_id(state, item) for item in affected]
+    proposed = [{**u, "text": text} if u is unit else u for u in state["units"]]
+    if split_structure_shapes(state["units"]) != split_structure_shapes(proposed):
+        raise RevisionError("preserve split table/list structure; merge the whole structure before changing it")
     unit["history"].append({"action": "edit", "text": unit["text"], "token": expected})
     unit["text"], unit["state"], unit["awaiting_review"] = text, "recheck", True
     unit["generation"] += 1
@@ -1044,6 +1083,46 @@ def merge_units(state, ids):
     new["inherited_change"] = any(u["inherited_change"] or u["text"] != u["initial_text"] for u in old)
     replace_units(state, old, [new], f"merge {','.join(ids)}")
     return new["id"]
+
+
+def split_structure_shapes(units):
+    """Keep shared table/list membership and item/cell structure across edits."""
+    text = "".join(unit["text"] for unit in units)
+    lines = source_lines(text)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    starts, ends, position = [], [], 0
+    for unit in units:
+        starts.append(position)
+        position += len(unit["text"])
+        ends.append(position)
+
+    @lru_cache(maxsize=None)
+    def owners(first, last):
+        start, end = offsets[first], offsets[last]
+        return tuple(units[i]["id"] for i in range(bisect_right(ends, start), bisect_left(starts, end))
+                     if starts[i] < ends[i])
+
+    parents = {"table_open", "bullet_list_open", "ordered_list_open"}
+    tags = {"table", "thead", "tbody", "tr", "th", "td", "ul", "ol", "li"}
+    result, maps, active, root_level = [], [], None, None
+    for node in syntax(text):
+        bounds = node.map if node.map is not None else (maps[-1] if maps else None)
+        if active is None and node.type in parents and len(owners(*bounds)) > 1:
+            active, root_level = [], node.level
+        if active is not None and node.tag in tags and node.nesting:
+            # The parser pads/truncates table cells, so also retain source separators.
+            separators = len(re.findall(r"(?<!\\)\|", lines[bounds[0]])) if node.type == "tr_open" else None
+            active.append((node.type, owners(*bounds), tuple(sorted(node.attrs.items())), separators))
+        if node.nesting == 1:
+            maps.append(bounds)
+        elif node.nesting == -1:
+            maps.pop()
+            if active is not None and node.level == root_level:
+                result.append(tuple(active))
+                active = None
+    return result
 
 
 def table_and_list_spans(units):
