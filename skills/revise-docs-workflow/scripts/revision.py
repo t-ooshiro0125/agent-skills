@@ -602,7 +602,8 @@ def view(state, unit):
         lines = source_lines(state["original"])
         original_text = "".join(lines[original[0] - 1:original[1]])
         original_scope = "specified_lines"
-    elif unit["initial_text"] in state["original"]:
+    elif (unit["initial_text"] in state["original"] and
+          state["original"].find(unit["initial_text"]) == state["original"].rfind(unit["initial_text"])):
         original_text, original_scope = unit["initial_text"], "matching_excerpt"
     else:
         original_text, original_scope = state["original"], "whole_document"

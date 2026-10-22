@@ -711,6 +711,28 @@ class ReviewTests(unittest.TestCase):
         with self.assertRaises(revision.RevisionError):
             revision.validate_state(value)
 
+    def test_repeated_original_excerpt_keeps_whole_context_until_lines_are_specified(self):
+        original = "# 許可後\n\n保管する。\n\n# 処理後\n\n保管する。\n\n"
+        value = revision.initialize(original, "保管する。\n\n", BRIEF)
+        unit = value["units"][0]
+        shown = revision.view(value, unit)["target"]
+        self.assertEqual(shown["original_scope"], "whole_document")
+        self.assertEqual(shown["original_text"], original)
+        revision.annotate(value, unit["id"], revision.token(value, unit), {"original_lines": [5, 8]})
+        shown = revision.view(value, unit)["target"]
+        self.assertEqual(shown["original_scope"], "specified_lines")
+        self.assertEqual(shown["original_text"], "# 処理後\n\n保管する。\n\n")
+
+    def test_unique_excerpt_is_shortened_but_overlapping_matches_keep_original_context(self):
+        for original, working, expected_scope in (
+                ("# 条件\n\n保管する。\n\n", "保管する。\n\n", "matching_excerpt"),
+                ("aaaa", "aaa", "whole_document")):
+            with self.subTest(expected_scope=expected_scope):
+                value = revision.initialize(original, working, BRIEF)
+                shown = revision.view(value, value["units"][0])["target"]
+                self.assertEqual(shown["original_scope"], expected_scope)
+                self.assertEqual(shown["original_text"], working if expected_scope == "matching_excerpt" else original)
+
     def test_annotation_and_review_history_survives_regrouping(self):
         value = state()
         unit = value["units"][0]
