@@ -122,7 +122,8 @@ def blocks(text):
     result, position = [], 0
     kinds = {"fence": "code", "code_block": "code", "heading_open": "heading",
              "bullet_list_open": "list", "ordered_list_open": "list",
-             "blockquote_open": "quote", "table_open": "table", "html_block": "html"}
+             "blockquote_open": "quote", "table_open": "table", "html_block": "html",
+             "hr": "separator"}
     for node in syntax(text):
         if node.level != 0 or node.map is None or node.nesting == -1:
             continue
@@ -445,8 +446,8 @@ def safe_cuts(text, cuts, kind):
         first, last = node.map
         start, end = offsets[first], offsets[last]
         inside = [cut for cut in cuts if start < cut < end]
-        if node.type in {"fence", "code_block", "heading_open", "html_block"} and inside:
-            raise RevisionError("keep code blocks, headings, and HTML blocks together")
+        if node.type in {"fence", "code_block", "heading_open", "html_block", "hr"} and inside:
+            raise RevisionError("keep code blocks, headings, HTML blocks, and thematic breaks together")
         if node.type == "list_item_open" and inside:
             raise RevisionError("split lists only between complete top-level items")
         if node.type == "table_open":

@@ -294,6 +294,25 @@ class SegmentationTests(unittest.TestCase):
         self.assertEqual(value["units"][-1]["kind"], "heading")
         self.assertIn("\u2028", value["units"][-1]["text"])
 
+    def test_thematic_breaks_remain_whole_in_root_quoted_and_merged_targets(self):
+        for marker in ("---", "***", "___", "- - -"):
+            for prefix in ("", "> "):
+                with self.subTest(marker=marker, prefix=prefix):
+                    separator = prefix + marker + "\n\n"
+                    value = state(separator + "後の段落。\n")
+                    if not prefix:
+                        self.assertEqual(value["units"][0]["kind"], "separator")
+                    uid = revision.merge_units(value, [u["id"] for u in value["units"]])
+                    unit = revision.unit_by_id(value, uid)
+                    text = unit["text"]
+                    cut = len(prefix) + 1
+                    with self.assertRaises(revision.RevisionError):
+                        revision.split_unit(value, uid, revision.token(value, unit),
+                                            [text[:cut], text[cut:]])
+                    revision.split_unit(value, uid, revision.token(value, unit),
+                                        [separator, "後の段落。\n"])
+                    self.assertEqual(revision.render(value), text)
+
     def test_reorder_requires_complete_permutation_and_invalidates_all(self):
         value = state()
         accept_all(value)
