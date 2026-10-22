@@ -116,6 +116,39 @@ def legacy_overwritten_unit_hold(outcome="unchanged"):
 
 
 class SegmentationTests(unittest.TestCase):
+    def test_old_missing_or_added_bom_requires_repair_before_export(self):
+        for prefix in ("\ufeff", ""):
+            with self.subTest(prefix=prefix):
+                value = state(prefix + "# Title\n\nBody.\n", limit=6)
+                accept_all(value)
+                final(value)
+                full = copy.deepcopy(value["final_review"])
+                unit = value["units"][0]
+                original = unit["text"]
+                unit["text"] = ("" if prefix else "\ufeff") + original.removeprefix("\ufeff")
+                unit["generation"] += 1
+                unit["inherited_change"] = True
+                unit["history"].append({"action": "edit", "text": original})
+                revision.touch(value, "legacy BOM change")
+                accept_all(value)
+                full["token"] = revision.document_token(value)
+                value["final_review"] = full
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "state.json"
+                    path.write_text(json.dumps(value))
+                    value = revision.load(path)
+                unit = value["units"][0]
+                with self.assertRaisesRegex(revision.RevisionError, "initial leading BOM"):
+                    revision.finish(value)
+                with self.assertRaisesRegex(revision.RevisionError, "initial leading BOM"):
+                    final(value)
+                revision.edit(value, unit["id"], revision.token(value, unit), original)
+                accept_all(value)
+                final(value)
+                result = revision.finish(value)
+                self.assertTrue(result["fully_resolved"])
+                self.assertEqual(result["text"].startswith("\ufeff"), bool(prefix))
+
     def test_edit_preserves_presence_and_absence_of_leading_bom(self):
         for prefix in ("\ufeff", ""):
             with self.subTest(prefix=prefix):

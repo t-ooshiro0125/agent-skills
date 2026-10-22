@@ -887,7 +887,7 @@ def edit(state, uid, expected, text, affected=(), all_affected=False):
         raise RevisionError("record the check of the last edit before editing again")
     impacted = [unit_by_id(state, item) for item in affected]
     proposed = [{**u, "text": text} if u is unit else u for u in state["units"]]
-    if render(state).startswith("\ufeff") != "".join(u["text"] for u in proposed).startswith("\ufeff"):
+    if state["initial_working"].startswith("\ufeff") != "".join(u["text"] for u in proposed).startswith("\ufeff"):
         raise RevisionError("keep the leading BOM unchanged when editing")
     if split_structure_shapes(state["units"]) != split_structure_shapes(proposed):
         raise RevisionError("preserve split table/list structure; merge the whole structure before changing it")
@@ -1264,7 +1264,7 @@ def reorder(state, ids):
             structure = "table headers and rows" if kind == "table_open" else "list items"
             raise RevisionError(f"keep split {structure} together in order; merge the structure before reordering its parts")
     ordered = [unit_by_id(state, uid) for uid in ids]
-    if render(state).startswith("\ufeff") != "".join(u["text"] for u in ordered).startswith("\ufeff"):
+    if state["initial_working"].startswith("\ufeff") != "".join(u["text"] for u in ordered).startswith("\ufeff"):
         raise RevisionError("keep the leading BOM at the start of the document when reordering")
     if Counter(spans) != Counter(table_and_list_spans(ordered)):
         raise RevisionError("reorder must preserve table and list boundaries")
@@ -1277,6 +1277,8 @@ def reorder(state, ids):
 def blocking_issues(state):
     refresh(state)
     issues = []
+    if render(state).startswith("\ufeff") != state["initial_working"].startswith("\ufeff"):
+        issues.append("restore the initial leading BOM before finishing")
     for unit in state["units"]:
         uid, review = unit["id"], unit.get("review")
         if unit["state"] not in TERMINAL:
