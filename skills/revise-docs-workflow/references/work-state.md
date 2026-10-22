@@ -98,7 +98,7 @@ python3 revision.py --state work.json edit --unit u0004 --token TOKEN --file tar
 python3 revision.py --state work.json show --unit u0004
 ```
 
-現行本文と参照文脈を実際に点検した後、別の `result.json` を作る。結果入力は `outcome` と `checks` だけで、基準の定義・省略・差し替えはできない。各 `criterion_version` は、最新の `required_criteria` に示された値を使う。本文・文脈・計画の版は CLI の `--token` に、基準の定義・完了条件の版は `criterion_version` に結び付く。
+現行本文と参照文脈を実際に点検した後、別の `result.json` を作る。結果入力は `outcome` と `checks` だけで、基準の定義・省略・差し替えはできない。点検時に取得した `token` と、同じ対象の `required_criteria` に示された基準の版を、それぞれ CLI の `--token` と各 `criterion_version` に使う。保存直前に最新の版を取り直して古い結果へ自動で付け直さない。版が変わったら対象と文脈を取得し直して点検する。本文・文脈・計画の版は `token` に、基準の定義・完了条件の版は `criterion_version` に結び付く。
 
 ```json
 {
