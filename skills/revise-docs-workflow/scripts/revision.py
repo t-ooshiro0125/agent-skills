@@ -28,6 +28,7 @@ STATES = {"pending", "recheck", "confirmed", "unchanged", "held"}
 TERMINAL = {"confirmed", "unchanged", "held"}
 OPAQUE = {"ok", "okay", "問題なし", "確認済み", "完了", "変更なし", "修正済み"}
 MARKDOWN = MarkdownIt("commonmark").enable("table")
+SPLIT_MARKDOWN = MarkdownIt("commonmark", {"inline_definitions": True}).enable("table")
 
 
 def source_lines(text):
@@ -852,21 +853,50 @@ def record_review(state, uid, expected, record):
     state["final_review"] = None
 
 
-def safe_cuts(text, cuts, kind):
+def inline_signature(parts, environment):
+    """Compare inline syntax without treating plain-text split boundaries as changes."""
+    result = []
+    for part in parts:
+        for node in SPLIT_MARKDOWN.parse(part, copy.deepcopy(environment)):
+            if node.type != "inline":
+                continue
+            for child in node.children or []:
+                if child.type in {"softbreak", "hardbreak"}:
+                    continue
+                if child.type == "text":
+                    content = "".join(child.content.split())
+                    if not content:
+                        continue
+                    if result and result[-1][0] == "text":
+                        result[-1] = ("text", result[-1][1] + content)
+                    else:
+                        result.append(("text", content))
+                else:
+                    result.append((child.type, child.tag, child.nesting,
+                                   child.attrs, child.content, child.markup))
+    return result
+
+
+def safe_cuts(text, cuts, kind, environment):
     lines = source_lines(text)
     offsets = [0]
     for line in lines:
         offsets.append(offsets[-1] + len(line))
     line_starts = {offset: index for index, offset in enumerate(offsets)}
     quoted = []
-    for node in syntax(text):
+    for node in SPLIT_MARKDOWN.parse(text, copy.deepcopy(environment)):
         if node.map is None:
             continue
         first, last = node.map
         start, end = offsets[first], offsets[last]
         inside = [cut for cut in cuts if start < cut < end]
-        if node.type in {"fence", "code_block", "heading_open", "html_block", "hr"} and inside:
-            raise RevisionError("keep code blocks, headings, HTML blocks, and thematic breaks together")
+        if node.type in {"fence", "code_block", "heading_open", "html_block", "hr", "definition"} and inside:
+            raise RevisionError("keep code blocks, headings, HTML blocks, thematic breaks, and link definitions together")
+        if node.type == "inline" and inside:
+            boundaries = [start, *inside, end]
+            parts = [text[first:last] for first, last in zip(boundaries, boundaries[1:])]
+            if inline_signature([text[start:end]], environment) != inline_signature(parts, environment):
+                raise RevisionError("keep inline Markdown such as code spans and links together")
         if node.type == "list_item_open" and inside:
             raise RevisionError("split lists only between complete top-level items")
         if node.type == "table_open":
@@ -939,7 +969,9 @@ def split_unit(state, uid, expected, parts):
     for part in parts[:-1]:
         offset += len(part)
         cuts.append(offset)
-    safe_cuts(unit["text"], cuts, unit["kind"])
+    environment = {}
+    MARKDOWN.parse(render(state), environment)
+    safe_cuts(unit["text"], cuts, unit["kind"], environment)
     children = []
     position = state["units"].index(unit)
     neighbors = [u["id"] for u in state["units"][max(0, position - 1):position + 2]
@@ -1001,29 +1033,43 @@ def merge_units(state, ids):
     return new["id"]
 
 
+def table_and_list_spans(units):
+    text = "".join(unit["text"] for unit in units)
+    lines = source_lines(text)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    ranges, offset = [], 0
+    for unit in units:
+        ranges.append((unit["id"], offset, offset + len(unit["text"])))
+        offset += len(unit["text"])
+    result = []
+    for node in syntax(text):
+        if node.type not in {"table_open", "bullet_list_open", "ordered_list_open"}:
+            continue
+        start, end = (offsets[line] for line in node.map)
+        result.append((node.type, tuple((uid, max(start - first, 0), min(end, last) - first)
+                                       for uid, first, last in ranges if first < end and start < last)))
+    return result
+
+
 def reorder(state, ids):
     current = [u["id"] for u in state["units"]]
     if len(ids) != len(current) or set(ids) != set(current) or len(ids) != len(set(ids)):
         raise RevisionError("reorder must contain every active identifier exactly once")
     if ids == current:
         return
-    lines = source_lines(render(state))
-    offsets = [0]
-    for line in lines:
-        offsets.append(offsets[-1] + len(line))
-    ranges, offset = [], 0
-    for unit in state["units"]:
-        ranges.append((unit["id"], offset, offset + len(unit["text"])))
-        offset += len(unit["text"])
     positions = {uid: index for index, uid in enumerate(ids)}
-    for node in syntax(render(state)):
-        if node.type != "table_open":
-            continue
-        start, end = (offsets[line] for line in node.map)
-        members = [positions[uid] for uid, first, last in ranges if first < end and start < last]
+    spans = table_and_list_spans(state["units"])
+    for kind, entries in spans:
+        members = [positions[entry[0]] for entry in entries]
         if members != list(range(members[0], members[0] + len(members))):
-            raise RevisionError("keep split table headers and rows together in order; merge the table before reordering its parts")
-    state["units"] = [unit_by_id(state, uid) for uid in ids]
+            structure = "table headers and rows" if kind == "table_open" else "list items"
+            raise RevisionError(f"keep split {structure} together in order; merge the structure before reordering its parts")
+    ordered = [unit_by_id(state, uid) for uid in ids]
+    if Counter(spans) != Counter(table_and_list_spans(ordered)):
+        raise RevisionError("reorder must preserve table and list boundaries")
+    state["units"] = ordered
     for unit in state["units"]:
         unit["generation"] += 1
     touch(state, "reorder document")
@@ -1068,9 +1114,18 @@ def validate_final_record(state, record):
     return criteria
 
 
+def current_document_hold(state):
+    expected = document_token(state)
+    records = [state["final_review"], *reversed(state["document_history"])]
+    return next((record for record in records if record and record.get("token") == expected
+                 and any(check["status"] == "held" for check in record["record"]["checks"])), None)
+
+
 def final_review(state, expected, record):
     if expected != document_token(state):
         raise RevisionError("stale document token")
+    if current_document_hold(state):
+        raise RevisionError("held document: invalidate affected targets with new information/decision before recording")
     issues = blocking_issues(state)
     if issues:
         raise RevisionError("unfinished targets: " + "; ".join(issues))
@@ -1086,6 +1141,8 @@ def finish(state):
     if not state["final_review"] or state["final_review"]["token"] != document_token(state):
         raise RevisionError("current-version full-document review is required")
     full = state["final_review"]
+    if current_document_hold(state) and not any(check["status"] == "held" for check in full["record"]["checks"]):
+        raise RevisionError("held document: invalidate affected targets before resolving the full-document hold")
     if full["criteria"] != validate_final_record(state, full["record"]):
         raise RevisionError("full-document criteria changed")
     held = [{"id": u["id"], "plan": u["plan"], **u["review"]} for u in state["units"]

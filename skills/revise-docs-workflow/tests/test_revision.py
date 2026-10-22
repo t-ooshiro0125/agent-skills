@@ -100,6 +100,45 @@ def final(value):
 
 
 class SegmentationTests(unittest.TestCase):
+    def test_inline_markdown_cannot_be_split_inside_its_syntax(self):
+        for markup in ("`--option`", "``a`b``", "`a\nb`", "[案内](https://example.test/path)",
+                       "![図](https://example.test/image)", "<https://example.test/path>",
+                       "**強調**", "*強調*", "\\*", "&amp;", "[案内][ref]"):
+            text = "[ref]: https://example.test/reference\n\n前" + markup + "後。\n"
+            value = state(text)
+            unit = next(u for u in value["units"] if u["text"].startswith("前"))
+            start = unit["text"].index(markup)
+            for index in range(1, len(markup)):
+                with self.subTest(markup=markup, index=index):
+                    cut = start + index
+                    before = copy.deepcopy(value)
+                    with self.assertRaises(revision.RevisionError):
+                        revision.split_unit(value, unit["id"], revision.token(value, unit),
+                                            [unit["text"][:cut], unit["text"][cut:]])
+                    self.assertEqual(value, before)
+
+    def test_plain_text_and_whole_inline_constructs_can_be_separate_targets(self):
+        for text, parts in (
+                ("前の説明。[案内](https://example.test/path)を参照する。\n",
+                 ["前の", "説明。", "[案内](https://example.test/path)", "を参照する。\n"]),
+                ("> 前の説明。\n> 次の説明。\n", ["> 前の説明。\n", "> 次の説明。\n"]),
+                ("前の説明。\r\n次の説明。\r\n", ["前の説明。\r\n", "次の説明。\r\n"])):
+            with self.subTest(text=text):
+                value = state(text)
+                unit = value["units"][0]
+                revision.split_unit(value, unit["id"], revision.token(value, unit), parts)
+                self.assertEqual(revision.render(value), text)
+        value = state("> 前 `a\n> b` 後。\n")
+        unit = value["units"][0]
+        with self.assertRaisesRegex(revision.RevisionError, "inline Markdown"):
+            revision.split_unit(value, unit["id"], revision.token(value, unit), ["> 前 `a\n", "> b` 後。\n"])
+        value = state("[ref]: https://example.test/path\n\n参照。\n")
+        unit = value["units"][0]
+        cut = unit["text"].index("path")
+        with self.assertRaisesRegex(revision.RevisionError, "link definitions"):
+            revision.split_unit(value, unit["id"], revision.token(value, unit),
+                                [unit["text"][:cut], unit["text"][cut:]])
+
     def test_lossless_reassembly_including_crlf_links_table_code_and_order(self):
         value = state(DOCUMENT)
         accept_all(value)
@@ -392,6 +431,35 @@ class SegmentationTests(unittest.TestCase):
         with self.assertRaisesRegex(revision.RevisionError, "table headers and rows"):
             revision.reorder(value, [ids[0], between["id"], second["id"], ids[1]])
         self.assertEqual(value, before)
+
+    def test_reorder_keeps_split_list_items_together(self):
+        for first, second in (("1. first\n   - nested\n", "2. second\n\n"),
+                              ("- first\n", "- second\n\n"),
+                              ("> 1. first\n", "> 2. second\n\n")):
+            with self.subTest(first=first):
+                value = state("前の段落。\n\n" + first + second + "後の段落。\n")
+                unit = value["units"][1]
+                ids = revision.split_unit(value, unit["id"], revision.token(value, unit), [first, second])
+                before_id, after_id = value["units"][0]["id"], value["units"][-1]["id"]
+                for order in ([before_id, ids[0], after_id, ids[1]],
+                              [before_id, ids[1], ids[0], after_id]):
+                    before = copy.deepcopy(value)
+                    with self.assertRaisesRegex(revision.RevisionError, "list items"):
+                        revision.reorder(value, order)
+                    self.assertEqual(value, before)
+                revision.reorder(value, [*ids, before_id, after_id])
+                self.assertEqual([u["id"] for u in value["units"]][:2], ids)
+
+    def test_reorder_preserves_list_and_table_boundaries_after_moving_whole_targets(self):
+        for text, order in (
+                ("移動する段落。\n\n1. first\n2. second\n", [1, 0]),
+                ("| A |\n| --- |\n| x |\n\n中間の段落。\n\n| B |\n| --- |\n| y |\n", [2, 0, 1])):
+            with self.subTest(text=text):
+                value = state(text)
+                before = copy.deepcopy(value)
+                with self.assertRaisesRegex(revision.RevisionError, "boundaries"):
+                    revision.reorder(value, [value["units"][i]["id"] for i in order])
+                self.assertEqual(value, before)
 
 
 class ReviewTests(unittest.TestCase):
@@ -1058,6 +1126,37 @@ class CriterionWorkflowTests(unittest.TestCase):
         self.assertFalse(result["fully_resolved"])
         self.assertEqual(result["held"][0]["id"], "document")
 
+    def test_document_hold_requires_invalidation_even_after_rechecking_a_unit(self):
+        value = state("対象。\n", limit=5)
+        accept_all(value)
+        ensure_plan(value)
+        held = {"original_comparison": "原文との照合には方針判断が残る",
+                "standalone_read": "説明の順序は読者が追える",
+                "checks": result_for(value, outcome="held")["checks"]}
+        revision.final_review(value, revision.document_token(value), held)
+        passed = {**held, "checks": result_for(value)["checks"]}
+        for payload in (held, passed):
+            before = copy.deepcopy(value)
+            with self.assertRaisesRegex(revision.RevisionError, "held document"):
+                revision.final_review(value, revision.document_token(value), payload)
+            self.assertEqual(value, before)
+        unit = value["units"][0]
+        revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit))
+        self.assertIsNone(value["final_review"])
+        with self.assertRaisesRegex(revision.RevisionError, "held document"):
+            revision.final_review(value, revision.document_token(value), passed)
+        # A legacy state that already overwrote a hold must not report it resolved.
+        value["final_review"] = {"record": passed, "token": revision.document_token(value),
+                                 "criteria": revision.validate_final_record(value, passed)}
+        with self.assertRaisesRegex(revision.RevisionError, "held document"):
+            revision.finish(value)
+        revision.invalidate(value, [unit["id"]], "保留していた方針の判断が得られた")
+        with self.assertRaisesRegex(revision.RevisionError, "unfinished targets"):
+            revision.final_review(value, revision.document_token(value), passed)
+        revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit))
+        revision.final_review(value, revision.document_token(value), passed)
+        self.assertTrue(revision.finish(value)["fully_resolved"])
+
     def test_results_are_not_derived_from_changed_text_or_plan(self):
         value = state("対象。\n")
         unit = value["units"][0]
@@ -1476,6 +1575,37 @@ class CliTests(unittest.TestCase):
                                  *map(str, args)], capture_output=True, text=True, umask=umask)
         self.assertEqual(result.returncode, 0 if success else 1, result.stderr)
         return result
+
+    def test_cli_rejects_held_document_overwrite_inline_split_and_list_reorder_without_saving(self):
+        value = state("対象。\n")
+        accept_all(value)
+        ensure_plan(value)
+        payload = {"original_comparison": "原文との照合で方針判断が残る",
+                   "standalone_read": "本文の対象と条件は読める",
+                   "checks": result_for(value, outcome="held")["checks"]}
+        revision.final_review(value, revision.document_token(value), payload)
+        revision.save(self.path, value)
+        result_path = self.root / "result.json"
+        result_path.write_text(json.dumps({**payload, "checks": result_for(value)["checks"]}))
+        before = self.path.read_bytes()
+        self.cli("final-review", "--token", revision.document_token(value), "--file", result_path, success=False)
+        self.assertEqual(self.path.read_bytes(), before)
+        value = state("前 `--option` 後。\n")
+        revision.save(self.path, value)
+        unit = value["units"][0]
+        result_path.write_text(json.dumps(["前 `--", "option` 後。\n"]))
+        before = self.path.read_bytes()
+        self.cli("split", "--unit", unit["id"], "--token", revision.token(value, unit),
+                 "--file", result_path, success=False)
+        self.assertEqual(self.path.read_bytes(), before)
+        value = state("1. first\n2. second\n\n後の段落。\n")
+        unit = value["units"][0]
+        ids = revision.split_unit(value, unit["id"], revision.token(value, unit),
+                                  ["1. first\n", "2. second\n\n"])
+        revision.save(self.path, value)
+        before = self.path.read_bytes()
+        self.cli("reorder", "--units", ids[0], value["units"][-1]["id"], ids[1], success=False)
+        self.assertEqual(self.path.read_bytes(), before)
 
     def test_cli_batch_expression_checks_use_content_tokens_and_keep_aggregate_checks_fresh(self):
         value = state("用語Aと用語B。\n", limit=5)
