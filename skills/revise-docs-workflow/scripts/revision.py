@@ -164,9 +164,9 @@ def blocks(text):
             kind, i = "code", i + 1
             while i < len(lines) and (not lines[i].strip() or lines[i].startswith(("    ", "\t"))):
                 i += 1
-        elif lines[i].lstrip().startswith(">"):
+        elif re.match(r"^ {0,3}>", lines[i]):
             kind, i = "quote", i + 1
-            while i < len(lines) and lines[i].lstrip().startswith(">"):
+            while i < len(lines) and re.match(r"^ {0,3}>", lines[i]):
                 i += 1
         elif lines[i].lstrip().startswith("<!--"):
             kind, i = "html", i + 1
@@ -489,6 +489,24 @@ def safe_cuts(text, cuts, kind):
                 position += len(line)
             if any(offset < cut < end and cut not in boundaries for cut in cuts):
                 raise RevisionError("split lists only between complete top-level items")
+        if block["kind"] == "quote":
+            inside = [cut - offset for cut in cuts if offset < cut < end]
+            if inside:
+                raw_position, inner_position, boundaries, inner_lines = 0, 0, {}, []
+                for line in block["text"].splitlines(keepends=True):
+                    boundaries[raw_position] = inner_position
+                    expanded = line.expandtabs(4)
+                    prefix = re.match(r"^ {0,3}>[ \t]?", expanded)
+                    inner = expanded[prefix.end():] if prefix else expanded
+                    inner_lines.append(inner)
+                    raw_position += len(line)
+                    inner_position += len(inner)
+                if any(cut not in boundaries for cut in inside):
+                    raise RevisionError("split quotes only before complete quoted lines")
+                inner_text = "".join(inner_lines)
+                candidates = blocks(inner_text)
+                inner_kind = candidates[0]["kind"] if len(candidates) == 1 else "group"
+                safe_cuts(inner_text, [boundaries[cut] for cut in inside], inner_kind)
         offset = end
     offset = 0
     lines = text.splitlines(keepends=True)
@@ -581,6 +599,10 @@ def split_unit(state, uid, expected, parts):
     elif unit["kind"] == "table_rows":
         for child in children:
             child["kind"] = "table_rows"
+    elif unit["kind"] == "quote":
+        # Keep a quoted table's column names (and any quoted introduction) in context.
+        for child in children[1:]:
+            child["context_ids"].append(children[0]["id"])
     replace_units(state, [unit], children, f"split {uid}")
     return [u["id"] for u in children]
 

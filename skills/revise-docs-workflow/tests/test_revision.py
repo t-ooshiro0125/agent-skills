@@ -188,6 +188,41 @@ class SegmentationTests(unittest.TestCase):
                                     [text[:cut], text[cut:]])
                 self.assertEqual(revision.render(value), value["original"])
 
+    def test_quoted_lists_headings_and_tables_keep_inner_structure_and_context(self):
+        cases = [
+            ("> - first item\n> - second item\n", "> - second", ["> - first item\n", "> - second item\n"]),
+            ("> > 1. first item\n> > 2. second item\n", "> > 2.",
+             ["> > 1. first item\n", "> > 2. second item\n"]),
+            ("> Title\n> ====\n> paragraph\n", "> paragraph",
+             ["> Title\n> ====\n", "> paragraph\n"]),
+            ("> | A | B |\n> | --- | --- |\n> | x | y |\n", "> | x",
+             ["> | A | B |\n> | --- | --- |\n", "> | x | y |\n"]),
+        ]
+        for text, _, parts in cases:
+            with self.subTest(text=text):
+                value = state(text)
+                unit = value["units"][0]
+                unsafe = text.index("item") + 2 if "item" in text else text.index("\n") + 1
+                with self.assertRaises(revision.RevisionError):
+                    revision.split_unit(value, unit["id"], revision.token(value, unit),
+                                        [text[:unsafe], text[unsafe:]])
+                self.assertEqual("".join(parts), text)
+                ids = revision.split_unit(value, unit["id"], revision.token(value, unit), parts)
+                self.assertEqual(revision.render(value), value["original"])
+                if "| A | B |" in text:
+                    row = revision.view(value, revision.unit_by_id(value, ids[-1]))
+                    self.assertTrue(any("| A | B |" in ref["text"]
+                                        for ref in row["reference_only"]["related"]))
+
+    def test_quote_markers_inside_quoted_code_are_literal_content(self):
+        text = "> " + TICKS + "md\n> > " + TICKS + "\n> code continues\n> " + TICKS + "\n"
+        value = state(text)
+        unit = value["units"][0]
+        cut = text.index("> code continues")
+        with self.assertRaises(revision.RevisionError):
+            revision.split_unit(value, unit["id"], revision.token(value, unit),
+                                [text[:cut], text[cut:]])
+
     def test_reorder_requires_complete_permutation_and_invalidates_all(self):
         value = state()
         accept_all(value)
