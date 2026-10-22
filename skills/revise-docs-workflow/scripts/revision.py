@@ -539,6 +539,42 @@ def upgrade(state, brief, max_iterations=None):
     return result
 
 
+@lru_cache(maxsize=8)
+def original_match_ranges(original, working):
+    """Locate unchanged initial blocks without matching a draft to an unrelated excerpt."""
+    if original == working:
+        return ((0,), (len(working),))
+    source = [block["text"] for block in blocks(original)]
+    draft = [block["text"] for block in blocks(working)]
+    if len(source) == len(draft):
+        pairs = [(i, i) for i in range(len(draft)) if source[i] == draft[i]]
+    else:
+        first = 0
+        while first < min(len(source), len(draft)) and source[first] == draft[first]:
+            first += 1
+        last = 0
+        while (last < min(len(source), len(draft)) - first
+               and source[-last - 1] == draft[-last - 1]):
+            last += 1
+        pairs = ([(i, i) for i in range(first)] +
+                 [(len(source) - i, len(draft) - i) for i in range(last, 0, -1)])
+        # A lone retained paragraph may instead be a replacement for another one.
+        if len(pairs) < 2:
+            pairs = []
+    source_counts, draft_counts = Counter(source), Counter(draft)
+    matches = {j for i, j in pairs if source_counts[source[i]] == draft_counts[draft[j]] == 1}
+    ranges, offset = [], 0
+    for index, text in enumerate(draft):
+        end = offset + len(text)
+        if index in matches:
+            if ranges and ranges[-1][1] == offset:
+                ranges[-1] = (ranges[-1][0], end)
+            else:
+                ranges.append((offset, end))
+        offset = end
+    return tuple(first for first, _ in ranges), tuple(last for _, last in ranges)
+
+
 def layout(state):
     """Build heading stacks and lookups once per document revision."""
     key = id(state)
@@ -548,7 +584,7 @@ def layout(state):
         return cached
     cached = {"state": state, "revision": state["revision"], "units": {}, "indices": {},
               "headings": {}, "expressions": {}, "containers": {},
-              "working_matches_original": state["initial_working"] == state["original"]}
+              "original_matches": original_match_ranges(state["original"], state["initial_working"])}
     starts, ends, position = [], [], 0
     for unit in state["units"]:
         starts.append(position)
@@ -762,9 +798,7 @@ def view(state, unit):
         lines = source_lines(state["original"])
         original_text = "".join(lines[original[0] - 1:original[1]])
         original_scope = "specified_lines"
-    elif (layout(state)["working_matches_original"] and not unit_changed(unit)
-          and unit["initial_text"] in state["original"] and
-          state["original"].find(unit["initial_text"]) == state["original"].rfind(unit["initial_text"])):
+    elif matching_original_excerpt(state, unit):
         original_text, original_scope = unit["initial_text"], "matching_excerpt"
     else:
         original_text, original_scope = state["original"], "whole_document"
@@ -778,6 +812,19 @@ def view(state, unit):
                        "required_criteria": criteria_for(state, "unit", unit["plan"])},
             "required_expressions": [expression_view(state, e) for e in expressions_for(state, unit)],
             "reference_only": context(state, unit), "previous_review": unit["review"]}
+
+
+def matching_original_excerpt(state, unit):
+    if unit_changed(unit):
+        return False
+    text, working, original = unit["initial_text"], state["initial_working"], state["original"]
+    start = working.find(text)
+    if (start < 0 or start != working.rfind(text) or original.find(text) < 0
+            or original.find(text) != original.rfind(text)):
+        return False
+    starts, ends = layout(state)["original_matches"]
+    index = bisect_right(starts, start) - 1
+    return index >= 0 and start + len(text) <= ends[index]
 
 
 def history(state, uid):
@@ -911,7 +958,7 @@ def edit(state, uid, expected, text, affected=(), all_affected=False):
     if leading_bom_count(state["initial_working"]) != leading_bom_count("".join(u["text"] for u in proposed)):
         raise RevisionError("keep the leading BOM unchanged when editing")
     if split_structure_shapes(state["units"]) != split_structure_shapes(proposed):
-        raise RevisionError("preserve split table/list structure; merge the whole structure before changing it")
+        raise RevisionError("preserve split table/list/quote structure; merge the whole structure before changing it")
     candidates = blocks(text)
     kind = candidates[0]["kind"] if len(candidates) == 1 else "group"
     if unit["kind"] == "table_rows":
@@ -1213,7 +1260,7 @@ def merge_units(state, ids):
 
 
 def split_structure_shapes(units):
-    """Keep shared table/list membership and item/cell structure across edits."""
+    """Keep shared table/list/quote membership and nested structure across edits."""
     text = "".join(unit["text"] for unit in units)
     lines = source_lines(text)
     offsets = [0]
@@ -1231,8 +1278,8 @@ def split_structure_shapes(units):
         return tuple(units[i]["id"] for i in range(bisect_right(ends, start), bisect_left(starts, end))
                      if starts[i] < ends[i])
 
-    parents = {"table_open", "bullet_list_open", "ordered_list_open"}
-    tags = {"table", "thead", "tbody", "tr", "th", "td", "ul", "ol", "li"}
+    parents = {"table_open", "bullet_list_open", "ordered_list_open", "blockquote_open"}
+    tags = {"table", "thead", "tbody", "tr", "th", "td", "ul", "ol", "li", "blockquote"}
     result, maps, active, root_level = [], [], None, None
     for node in syntax(text):
         bounds = node.map if node.map is not None else (maps[-1] if maps else None)

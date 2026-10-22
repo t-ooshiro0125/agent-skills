@@ -73,7 +73,7 @@ python3 revision.py --state work.json show --unit u0004
 python3 revision.py --state work.json show --history u0004
 ```
 
-原文対応を自動で確定できない場合は `original_scope: whole_document` として原文全体を返す。変更済みの対象や、初期作業本文が原文と異なる場合も、明示した `original_lines` がなければ原文全体を返す。初期作業本文を原文と取り違えない。既存の指摘・根拠や参照を残す場合は `annotate` を使う。入力できるのは `findings`、`context_note`、`context_ids`、原文の包含行範囲 `original_lines`。これらは確認結果にはならない。
+原文と初期作業本文をブロックごとに照合し、対応する未変更範囲に含まれ、両方の本文で一意に一致する対象は原文を抜粋して返す。ブロック数が同じ場合は同じ位置の内容を照合する。数が異なる場合は、先頭・末尾から連続して一致するブロックが合計二つ以上ある範囲を使う。変更済みの対象や、対応が曖昧な対象は `original_scope: whole_document` として原文全体を返す。初期作業本文が一部異なっていても、対応を確認できる他の対象は抜粋を使う。明示した原文の包含行範囲 `original_lines` があれば、その範囲を優先する。初期作業本文を原文と取り違えない。既存の指摘・根拠や参照を残す場合は `annotate` を使う。入力できるのは `findings`、`context_note`、`context_ids`、`original_lines`。これらは確認結果にはならない。
 
 計画は、問題・根拠・修正案・保持条件と、`unit` 段階に登録した全基準 ID に対応する具体的な完了条件に限定する。`criteria` の値は、この対象で何が理解できればよいかを示す文字列にする。
 

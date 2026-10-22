@@ -139,6 +139,30 @@ def legacy_released_historical_hold(outcome="confirmed"):
 
 
 class SegmentationTests(unittest.TestCase):
+    def test_edit_preserves_split_quote_membership_and_nesting(self):
+        for prefix in ("> ", "> > "):
+            with self.subTest(prefix=prefix):
+                parts = [prefix + "first\n", prefix + "second\n\n"]
+                value = state("Outside.\n\n" + "".join(parts) + "After.\n")
+                whole = value["units"][1]
+                ids = revision.split_unit(value, whole["id"], revision.token(value, whole), parts)
+                first = revision.unit_by_id(value, ids[0])
+                before = copy.deepcopy(value)
+                for changed in ("first\n", "> > > first\n"):
+                    with self.assertRaisesRegex(revision.RevisionError, "split table/list/quote structure"):
+                        revision.edit(value, first["id"], revision.token(value, first), changed)
+                    self.assertEqual(value, before)
+                revision.edit(value, first["id"], revision.token(value, first), prefix + "revised\n")
+                accept_all(value)
+                final(value)
+                self.assertIn(prefix + "revised\n" + parts[1], revision.finish(value)["text"])
+                merged_id = revision.merge_units(value, ids)
+                merged = revision.unit_by_id(value, merged_id)
+                revision.edit(value, merged_id, revision.token(value, merged), "revised\n\nsecond\n\n")
+                accept_all(value)
+                final(value)
+                self.assertTrue(revision.finish(value)["fully_resolved"])
+
     def test_split_edited_text_does_not_match_an_unrelated_original_excerpt(self):
         original = "Original target.\n\nUnrelated unique fragment.\n"
         value = state(original)
@@ -370,7 +394,7 @@ class SegmentationTests(unittest.TestCase):
                         final(value)
                         self.assertTrue(revision.finish(value)["fully_resolved"])
                     else:
-                        with self.assertRaisesRegex(revision.RevisionError, "split table/list structure"):
+                        with self.assertRaisesRegex(revision.RevisionError, "split table/list/quote structure"):
                             revision.edit(value, unit["id"], revision.token(value, unit), replacement)
                         self.assertEqual(value, before)
 
@@ -1464,6 +1488,53 @@ class ReviewTests(unittest.TestCase):
                 self.assertEqual(shown["original_scope"], "specified_lines")
                 self.assertEqual(shown["original_text"], "Original first.\n")
 
+    def test_local_initial_draft_changes_keep_other_targets_original_excerpts(self):
+        paragraphs = [f"Paragraph {i}.\n\n" for i in range(40)]
+        original = "".join(paragraphs)
+        for changed in (0, 20, 39):
+            with self.subTest(changed=changed):
+                working = paragraphs.copy()
+                working[changed] = "Revised initial paragraph.\n\n"
+                value = revision.initialize(original, "".join(working), BRIEF)
+                for index, unit in enumerate(value["units"]):
+                    shown = revision.view(value, unit)["target"]
+                    if index == changed:
+                        self.assertEqual(shown["original_scope"], "whole_document")
+                        self.assertEqual(shown["original_text"], original)
+                    else:
+                        self.assertEqual(shown["original_scope"], "matching_excerpt")
+                        self.assertEqual(shown["original_text"], paragraphs[index])
+
+    def test_initial_insertions_and_deletions_preserve_anchored_excerpts(self):
+        original = "First.\n\nSecond.\n\nThird.\n\nLast.\n\n"
+        for working in (original.replace("Second.", "Inserted.\n\nSecond."),
+                        original.replace("Second.\n\n", "")):
+            with self.subTest(working=working):
+                value = revision.initialize(original, working, BRIEF)
+                for unit in value["units"]:
+                    shown = revision.view(value, unit)["target"]
+                    expected = "whole_document" if unit["text"].startswith("Inserted.") else "matching_excerpt"
+                    self.assertEqual(shown["original_scope"], expected)
+        value = revision.initialize(original, original.replace("First.\n\nSecond.", "Second.\n\nFirst."), BRIEF)
+        for unit in value["units"][:2]:
+            self.assertEqual(revision.view(value, unit)["target"]["original_scope"], "whole_document")
+
+    def test_initial_original_alignment_is_cached_across_target_views_and_revisions(self):
+        original = "Cache first.\n\nCache second.\n\nCache last.\n"
+        working = original.replace("second", "revised")
+        value = revision.initialize(original, working, BRIEF)
+        revision.original_match_ranges.cache_clear()
+        with patch.object(revision, "blocks", wraps=revision.blocks) as parse_blocks:
+            for _ in range(3):
+                for unit in value["units"]:
+                    revision.view(value, unit)
+            self.assertEqual(parse_blocks.call_count, 3)
+            unit = value["units"][0]
+            revision.annotate(value, unit["id"], revision.token(value, unit), {"context_note": "Check context"})
+            for unit in value["units"]:
+                revision.view(value, unit)
+            self.assertEqual(parse_blocks.call_count, 4)
+
     def test_annotation_and_review_history_survives_regrouping(self):
         value = state()
         unit = value["units"][0]
@@ -2397,6 +2468,17 @@ class ExpressionTrackingTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_cli_local_initial_draft_change_keeps_unchanged_original_excerpt(self):
+        self.original.write_text("Original first.\n\nUnchanged second.\n\nLast.\n")
+        working = self.root / "working.md"
+        working.write_text("Revised first.\n\nUnchanged second.\n\nLast.\n")
+        self.cli("init", "--original", self.original, "--working", working, "--brief", self.brief)
+        first = json.loads(self.cli("next").stdout)["target"]
+        self.assertEqual(first["original_scope"], "whole_document")
+        second = json.loads(self.cli("show", "--unit", "u0002").stdout)["target"]
+        self.assertEqual(second["original_scope"], "matching_excerpt")
+        self.assertEqual(second["original_text"], "Unchanged second.\n\n")
+
     def test_cli_working_copy_uses_whole_original_until_its_source_lines_are_given(self):
         original = "Original first.\n\nUnique second.\n\n"
         self.original.write_text(original)
