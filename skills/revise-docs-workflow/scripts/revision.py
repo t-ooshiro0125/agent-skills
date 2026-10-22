@@ -813,13 +813,17 @@ def edit(state, uid, expected, text, affected=(), all_affected=False):
     proposed = [{**u, "text": text} if u is unit else u for u in state["units"]]
     if split_structure_shapes(state["units"]) != split_structure_shapes(proposed):
         raise RevisionError("preserve split table/list structure; merge the whole structure before changing it")
+    candidates = blocks(text)
+    kind = candidates[0]["kind"] if len(candidates) == 1 else "group"
+    if unit["kind"] == "table_rows":
+        kind = "table_rows"
     if all_affected:
         impacted = state["units"]
     changed_ids = {uid, *(other["id"] for other in impacted)}
     previous_contexts = {other["id"]: digest(context(state, other)) for other in state["units"]
                          if other["id"] not in changed_ids}
     unit["history"].append({"action": "edit", "text": unit["text"], "token": expected})
-    unit["text"], unit["state"], unit["awaiting_review"] = text, "recheck", True
+    unit["text"], unit["kind"], unit["state"], unit["awaiting_review"] = text, kind, "recheck", True
     unit["generation"] += 1
     for other in impacted:
         if other is not unit:

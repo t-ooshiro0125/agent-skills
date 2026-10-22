@@ -100,6 +100,55 @@ def final(value):
 
 
 class SegmentationTests(unittest.TestCase):
+    def test_edit_reclassifies_whole_targets_before_splitting(self):
+        table_parts = ["| A | B |\n| --- | --- |\n", "| x | 1 |\n", "| y | 2 |\n"]
+        cases = [("table", "".join(table_parts), table_parts),
+                 ("list", "- first\n- second\n", ["- first\n", "- second\n"]),
+                 ("heading", "# Heading\n", None),
+                 ("code", TICKS + "\ncode\n" + TICKS + "\n", None)]
+        for kind, text, parts in cases:
+            with self.subTest(kind=kind):
+                value = state("Original paragraph.\n")
+                unit = value["units"][0]
+                revision.edit(value, unit["id"], revision.token(value, unit), text)
+                self.assertEqual(unit["kind"], kind)
+                revision.record_review(value, unit["id"], revision.token(value, unit),
+                                       result_for(value, unit, "confirmed"))
+                if parts:
+                    ids = revision.split_unit(value, unit["id"], revision.token(value, unit), parts)
+                    self.assertEqual(revision.render(value), text)
+                    if kind == "table":
+                        self.assertEqual([revision.unit_by_id(value, uid)["kind"] for uid in ids],
+                                         ["table", "table_rows", "table_rows"])
+                else:
+                    with self.assertRaises(revision.RevisionError):
+                        revision.split_unit(value, unit["id"], revision.token(value, unit), [text[:2], text[2:]])
+        value = state("".join(table_parts))
+        unit = value["units"][0]
+        revision.edit(value, unit["id"], revision.token(value, unit), "Revised paragraph.\n")
+        self.assertEqual(unit["kind"], "paragraph")
+        revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit, "confirmed"))
+        revision.split_unit(value, unit["id"], revision.token(value, unit), ["Revised ", "paragraph.\n"])
+
+    def test_table_cell_edits_keep_escaped_pipes_with_even_and_odd_backslashes(self):
+        for count in range(1, 5):
+            with self.subTest(backslashes=count):
+                parts = ["| A | B |\n| --- | --- |\n", "| x | y |\n"]
+                value = state("".join(parts))
+                table = value["units"][0]
+                ids = revision.split_unit(value, table["id"], revision.token(value, table), parts)
+                row = revision.unit_by_id(value, ids[1])
+                ensure_plan(value, row)
+                text = "| a " + chr(92) * count + "| b | c |\n"
+                revision.edit(value, row["id"], revision.token(value, row), text)
+                self.assertEqual(row["kind"], "table_rows")
+                cells = [node.content for node in revision.syntax(revision.render(value)) if node.type == "inline"]
+                self.assertEqual(cells[-1], "c")
+                self.assertEqual(len(cells), 4)
+                revision.record_review(value, row["id"], revision.token(value, row), result_for(value, row, "confirmed"))
+                with self.assertRaisesRegex(revision.RevisionError, "tables.*rows"):
+                    revision.split_unit(value, row["id"], revision.token(value, row), [text[:3], text[3:]])
+
     def test_edit_preserves_split_table_rows_and_list_items(self):
         cases = [
             (["| A | B |\n| --- | --- |\n", "| x | 1 |\n", "| y | 2 |\n"],
