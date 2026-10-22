@@ -151,7 +151,7 @@ class SegmentationTests(unittest.TestCase):
             revision.document_token(value)
             revision.status(value)
             revision.document_token(value)
-            self.assertEqual(parsed.call_count, len(value["units"]))
+            parsed.assert_called_once_with(text)
         heading, following = value["units"][:2]
         ensure_plan(value, heading)
         revision.edit(value, heading["id"], revision.token(value, heading), "# Revised heading\n\n")
@@ -159,6 +159,60 @@ class SegmentationTests(unittest.TestCase):
         self.assertEqual(view["headings"], [{"level": 1, "text": "# Revised heading\n\n"}])
         view["headings"][0]["text"] = "changed by caller"
         self.assertEqual(revision.context(value, following)["headings"][0]["text"], "# Revised heading\n\n")
+
+    def test_heading_context_uses_connected_markdown_across_target_boundaries(self):
+        value = state("Title\n\n---\n\nFollowing.\n")
+        title, underline, following = value["units"]
+        revision.edit(value, title["id"], revision.token(value, title), "Title\n")
+        self.assertEqual(revision.context(value, following)["headings"],
+                         [{"level": 2, "text": "Title\n---\n\n"}])
+        self.assertEqual(revision.context(value, underline)["headings"], [])
+        value = state("# Heading\n\nText\n")
+        heading, following = value["units"]
+        revision.edit(value, heading["id"], revision.token(value, heading), TICKS + "\n# Heading\n\n")
+        self.assertEqual(revision.context(value, following)["headings"], [])
+
+    def test_merging_table_rows_preserves_row_boundaries_on_resplit(self):
+        parts = ["| A | B |\r\n| --- | --- |\r\n", "| x | 1 |\r\n", "| y | 2 |\r\n"]
+        value = state("".join(parts))
+        table = value["units"][0]
+        ids = revision.split_unit(value, table["id"], revision.token(value, table), parts)
+        merged = revision.merge_units(value, ids[1:])
+        unit = revision.unit_by_id(value, merged)
+        self.assertEqual(unit["kind"], "table_rows")
+        before = copy.deepcopy(value)
+        with self.assertRaisesRegex(revision.RevisionError, "tables.*rows"):
+            revision.split_unit(value, merged, revision.token(value, unit), ["| x", " | 1 |\r\n" + parts[2]])
+        self.assertEqual(value, before)
+        children = revision.split_unit(value, merged, revision.token(value, unit), parts[1:])
+        self.assertTrue(all(revision.unit_by_id(value, uid)["kind"] == "table_rows" for uid in children))
+        self.assertEqual(revision.render(value), "".join(parts))
+        for uid in children:
+            self.assertIn(ids[0], revision.unit_by_id(value, uid)["context_ids"])
+        whole = revision.merge_units(value, [ids[0], *children])
+        self.assertEqual(revision.unit_by_id(value, whole)["kind"], "table")
+
+    def test_split_checks_connected_structure_after_rows_are_merged_with_a_paragraph(self):
+        parts = ["| A |\n| --- |\n", "| x |\n", "| y |\n\n"]
+        value = state("".join(parts) + "Following.\n")
+        table, following = value["units"]
+        ids = revision.split_unit(value, table["id"], revision.token(value, table), parts)
+        uid = revision.merge_units(value, [*ids[1:], following["id"]])
+        unit = revision.unit_by_id(value, uid)
+        before = copy.deepcopy(value)
+        with self.assertRaises(revision.RevisionError):
+            revision.split_unit(value, uid, revision.token(value, unit), ["| x", unit["text"][3:]])
+        self.assertEqual(value, before)
+
+    def test_split_cannot_cut_a_heading_formed_across_target_boundaries(self):
+        value = state("Title\n\n---\n\nFollowing.\n")
+        title = value["units"][0]
+        revision.edit(value, title["id"], revision.token(value, title), "Title\n")
+        revision.record_review(value, title["id"], revision.token(value, title), result_for(value, title, "confirmed"))
+        before = copy.deepcopy(value)
+        with self.assertRaisesRegex(revision.RevisionError, "headings"):
+            revision.split_unit(value, title["id"], revision.token(value, title), ["Ti", "tle\n"])
+        self.assertEqual(value, before)
 
     def test_leading_bom_preserves_structure_context_and_source_offsets(self):
         for text, kind in (("\ufeff# 題名\r\n\r\n説明。\r\n", "heading"),
@@ -2428,6 +2482,84 @@ class CliTests(unittest.TestCase):
                 revision.write_many_atomic([(output, "新しい本文"), (report, "新しいレポート")])
         self.assertFalse(output.exists())
         self.assertEqual(report.read_text(), "既存のレポート")
+
+    def test_output_interruptions_restore_both_files_even_after_replace_succeeds(self):
+        output, report = self.root / "output.md", self.root / "report.json"
+        replace = revision.os.replace
+        for exception in (KeyboardInterrupt, SystemExit, RuntimeError):
+            for after_replace in (False, True):
+                with self.subTest(exception=exception, after_replace=after_replace):
+                    output.write_text("original document")
+                    report.write_text("original report")
+                    interrupted = False
+
+                    def interrupt(source, destination):
+                        nonlocal interrupted
+                        if Path(destination) == report and not interrupted:
+                            interrupted = True
+                            if after_replace:
+                                replace(source, destination)
+                            raise exception("interrupted output")
+                        return replace(source, destination)
+
+                    with patch.object(revision.os, "replace", side_effect=interrupt):
+                        with self.assertRaises(exception):
+                            revision.write_many_atomic([(output, "new document"), (report, "new report")])
+                    self.assertEqual(output.read_text(), "original document")
+                    self.assertEqual(report.read_text(), "original report")
+                    self.assertFalse(list(self.root.glob(".revision-*.tmp")))
+
+    def test_single_output_interrupt_preserves_original_or_removes_new_file(self):
+        output = self.root / "output.md"
+        replace = revision.os.replace
+        for existing in (False, True):
+            with self.subTest(existing=existing):
+                if existing:
+                    output.write_text("original document")
+                interrupted = False
+
+                def interrupt(source, destination):
+                    nonlocal interrupted
+                    result = replace(source, destination)
+                    if not interrupted:
+                        interrupted = True
+                        raise KeyboardInterrupt("after replacement")
+                    return result
+
+                with patch.object(revision.os, "replace", side_effect=interrupt):
+                    with self.assertRaises(KeyboardInterrupt):
+                        revision.write_atomic(output, "new document")
+                if existing:
+                    self.assertEqual(output.read_text(), "original document")
+                else:
+                    self.assertFalse(output.exists())
+                self.assertFalse(list(self.root.glob(".revision-*.tmp")))
+
+    def test_interruption_during_restoration_retains_the_recovery_copy(self):
+        output, report = self.root / "output.md", self.root / "report.json"
+        output.write_text("original document")
+        report.write_text("original report")
+        replace = revision.os.replace
+        replacements = 0
+
+        def interrupt(source, destination):
+            nonlocal replacements
+            if Path(destination) == output:
+                replacements += 1
+                if replacements > 1:
+                    raise KeyboardInterrupt("restoration interrupted")
+            if Path(destination) == report:
+                raise SystemExit("report interrupted")
+            return replace(source, destination)
+
+        with patch.object(revision.os, "replace", side_effect=interrupt):
+            with self.assertRaises(revision.RevisionError) as error:
+                revision.write_many_atomic([(output, "new document"), (report, "new report")])
+        copies = list(self.root.glob(".revision-*.tmp"))
+        self.assertEqual(len(copies), 1)
+        self.assertEqual(copies[0].read_text(), "original document")
+        self.assertIn(str(copies[0]), str(error.exception))
+        self.assertEqual(report.read_text(), "original report")
 
     def test_failed_restoration_keeps_recovery_copy_and_reports_its_path(self):
         output, report = self.root / "output.md", self.root / "report.json"

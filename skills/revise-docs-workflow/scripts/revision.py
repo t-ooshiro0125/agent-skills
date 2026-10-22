@@ -95,18 +95,18 @@ def stage_file(path, data, *, new_mode=0o600):
 
 def write_many_atomic(outputs, *, new_mode=0o600):
     """Stage every output first and restore committed files on replacement errors."""
-    staged, backups, committed, recovery = [], {}, [], set()
+    staged, backups, recovery = [], {}, set()
     try:
         for path, text in outputs:
             path = Path(path)
             staged.append((path, stage_file(path, text.encode("utf-8"), new_mode=new_mode)))
-        if len(staged) > 1:
-            for path, _ in staged:
-                backups[path] = stage_file(path, path.read_bytes()) if path.exists() else None
+        for path, _ in staged:
+            backups[path] = stage_file(path, path.read_bytes()) if path.exists() else None
         for path, name in staged:
             os.replace(name, path)
-            committed.append(path)
-    except OSError as error:
+    except BaseException as error:
+        # A signal can arrive after replace succeeds but before Python records it.
+        committed = [path for path, name in staged if not os.path.exists(name)]
         failures = []
         for path in reversed(committed):
             backup = backups.get(path)
@@ -115,7 +115,7 @@ def write_many_atomic(outputs, *, new_mode=0o600):
                     os.replace(backup, path)
                 else:
                     path.unlink()
-            except OSError as restore_error:
+            except BaseException as restore_error:
                 if backup:
                     recovery.add(backup)
                 failures.append(f"{path}: {restore_error}; recovery copy: {backup}")
@@ -498,16 +498,23 @@ def layout(state):
         return cached
     cached = {"state": state, "revision": state["revision"], "units": {}, "indices": {},
               "headings": {}, "expressions": {}}
-    headings = []
+    heading_blocks, offset = [], 0
+    for block in blocks(render(state)):
+        offset += len(block["text"])
+        if block["kind"] == "heading":
+            heading_blocks.append((offset, block))
+    headings, heading_index, position = [], 0, 0
     for index, unit in enumerate(state["units"]):
+        while heading_index < len(heading_blocks) and heading_blocks[heading_index][0] <= position:
+            block = heading_blocks[heading_index][1]
+            level = block["level"]
+            headings = [h for h in headings if h["level"] < level]
+            headings.append({"level": level, "text": block["text"]})
+            heading_index += 1
         uid = unit["id"]
         cached["units"][uid], cached["indices"][uid] = unit, index
         cached["headings"][uid] = list(headings)
-        for block in blocks(unit["text"]):
-            if block["kind"] == "heading":
-                level = block["level"]
-                headings = [h for h in headings if h["level"] < level]
-                headings.append({"level": level, "text": block["text"]})
+        position += len(unit["text"])
     for expression in state.get("expressions", {}).values():
         for uid in expression["owners"]:
             cached["expressions"].setdefault(uid, []).append(expression)
@@ -1022,10 +1029,13 @@ def split_unit(state, uid, expected, parts):
         offset += len(part)
         cuts.append(offset)
     environment = {}
-    MARKDOWN.parse(markdown_source(render(state)), environment)
+    document = render(state)
+    MARKDOWN.parse(markdown_source(document), environment)
+    position = state["units"].index(unit)
+    start = sum(len(u["text"]) for u in state["units"][:position])
+    safe_cuts(document, [start + cut for cut in cuts], unit["kind"], environment)
     safe_cuts(unit["text"], cuts, unit["kind"], environment)
     children = []
-    position = state["units"].index(unit)
     neighbors = [u["id"] for u in state["units"][max(0, position - 1):position + 2]
                  if u is not unit]
     for part in parts:
@@ -1062,7 +1072,11 @@ def merge_units(state, ids):
         raise RevisionError("merge requires contiguous units in document order")
     check_regroupable(state, old)
     text = "".join(u["text"] for u in old)
-    new = make_unit(state, text, "group", ids)
+    candidates = blocks(text)
+    kind = candidates[0]["kind"] if len(candidates) == 1 else "group"
+    if all(u["kind"] == "table_rows" for u in old):
+        kind = "table_rows"
+    new = make_unit(state, text, kind, ids)
     new["notes"]["inherited"] = [copy.deepcopy(u["notes"]) for u in old]
     new["notes"]["inherited_plans"] = [copy.deepcopy(u["plan"]) for u in old]
     if all(u["plan"] for u in old):
