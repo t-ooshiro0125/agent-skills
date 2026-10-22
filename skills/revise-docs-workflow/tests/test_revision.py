@@ -88,7 +88,8 @@ def hold():
 def accept_all(value):
     for unit in value["units"]:
         ensure_plan(value, unit)
-        revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit))
+        outcome = "confirmed" if revision.unit_changed(unit) else "unchanged"
+        revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit, outcome))
 
 
 def final(value):
@@ -115,6 +116,26 @@ def legacy_overwritten_unit_hold(outcome="unchanged"):
 
 
 class SegmentationTests(unittest.TestCase):
+    def test_edit_preserves_presence_and_absence_of_leading_bom(self):
+        for prefix in ("\ufeff", ""):
+            with self.subTest(prefix=prefix):
+                value = state(prefix + "# Title\r\n\r\nBody.\r\n")
+                unit = value["units"][0]
+                before = copy.deepcopy(value)
+                replacement = ("" if prefix else "\ufeff") + "# Updated\r\n\r\n"
+                with self.assertRaisesRegex(revision.RevisionError, "leading BOM"):
+                    revision.edit(value, unit["id"], revision.token(value, unit), replacement)
+                self.assertEqual(value, before)
+                if prefix:
+                    with self.assertRaisesRegex(revision.RevisionError, "leading BOM"):
+                        revision.edit(value, unit["id"], revision.token(value, unit), "")
+                    self.assertEqual(value, before)
+                revision.edit(value, unit["id"], revision.token(value, unit), prefix + "# Updated\r\n\r\n")
+                accept_all(value)
+                final(value)
+                self.assertEqual(revision.finish(value)["text"].startswith("\ufeff"), bool(prefix))
+                self.assertEqual(value["original_hash"], before["original_hash"])
+
     def test_reorder_keeps_the_leading_bom_at_the_start(self):
         value = state("\ufeff# Title\r\n\r\nFirst.\r\n\r\nSecond.\r\n")
         first, second, third = value["units"]
@@ -708,6 +729,62 @@ class SegmentationTests(unittest.TestCase):
 
 
 class ReviewTests(unittest.TestCase):
+    def test_restored_text_is_confirmed_and_change_status_survives_regrouping(self):
+        value = state("First.\n\nSecond.\n", limit=6)
+        unit = value["units"][0]
+        original = unit["text"]
+        revision.edit(value, unit["id"], revision.token(value, unit), original)
+        self.assertFalse(unit["inherited_change"])
+        revision.edit(value, unit["id"], revision.token(value, unit), "Revised.\n\n")
+        self.assertTrue(unit["inherited_change"])
+        revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit, "confirmed"))
+        revision.edit(value, unit["id"], revision.token(value, unit), original)
+        self.assertTrue(unit["inherited_change"])
+        before = copy.deepcopy(value)
+        with self.assertRaisesRegex(revision.RevisionError, "modified text"):
+            revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit))
+        self.assertEqual(value, before)
+        revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit, "confirmed"))
+        ids = revision.split_unit(value, unit["id"], revision.token(value, unit), ["First.", "\n\n"])
+        for uid in ids:
+            child = revision.unit_by_id(value, uid)
+            with self.assertRaisesRegex(revision.RevisionError, "modified text"):
+                revision.record_review(value, uid, revision.token(value, child), result_for(value, child))
+        merged = revision.merge_units(value, [u["id"] for u in value["units"]])
+        unit = revision.unit_by_id(value, merged)
+        with self.assertRaisesRegex(revision.RevisionError, "modified text"):
+            revision.record_review(value, merged, revision.token(value, unit), result_for(value, unit))
+        accept_all(value)
+        final(value)
+        self.assertEqual(unit["state"], "confirmed")
+        self.assertEqual(revision.finish(value)["text"], value["original"])
+
+    def test_legacy_restored_text_cannot_export_an_unchanged_result(self):
+        value = state("First.\n", limit=6)
+        unit = value["units"][0]
+        for text in ("Revised.\n", "First.\n"):
+            revision.edit(value, unit["id"], revision.token(value, unit), text)
+            revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit, "confirmed"))
+        final(value)
+        unit["inherited_change"] = False
+        unit["review"]["record"]["outcome"] = "unchanged"
+        unit["state"] = "unchanged"
+        unit["history"].append({"action": "review", **copy.deepcopy(unit["review"])})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            path.write_text(json.dumps(value))
+            value = revision.load(path)
+        unit = value["units"][0]
+        self.assertEqual(unit["state"], "recheck")
+        self.assertEqual(revision.next_target(value)["target"]["id"], unit["id"])
+        with self.assertRaises(revision.RevisionError):
+            revision.finish(value)
+        with self.assertRaisesRegex(revision.RevisionError, "modified text"):
+            revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit))
+        accept_all(value)
+        final(value)
+        self.assertTrue(revision.finish(value)["fully_resolved"])
+
     def test_old_overwritten_unit_holds_block_completion_until_explicit_release(self):
         for outcome in ("confirmed", "unchanged"):
             with self.subTest(outcome=outcome):
@@ -2012,6 +2089,40 @@ class ExpressionTrackingTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_cli_keeps_bom_and_rejects_unchanged_after_restoring_text(self):
+        value = state("\ufeff# Title\n\nBody.\n", limit=6)
+        revision.save(self.path, value)
+        unit = value["units"][0]
+        original = unit["text"]
+        edit_file, result_file = self.root / "edit.md", self.root / "result.json"
+        before = self.path.read_bytes()
+        edit_file.write_text("# Revised\n\n")
+        self.cli("edit", "--unit", unit["id"], "--token", revision.token(value, unit), "--file", edit_file,
+                 success=False)
+        self.assertEqual(self.path.read_bytes(), before)
+        for text in ("\ufeff# Revised\n\n", original):
+            value = revision.load(self.path)
+            unit = value["units"][0]
+            edit_file.write_text(text)
+            self.cli("edit", "--unit", unit["id"], "--token", revision.token(value, unit), "--file", edit_file)
+            value = revision.load(self.path)
+            unit = value["units"][0]
+            if text == original:
+                result_file.write_text(json.dumps(result_for(value, unit)))
+                before = self.path.read_bytes()
+                self.cli("record", "--unit", unit["id"], "--token", revision.token(value, unit),
+                         "--file", result_file, success=False)
+                self.assertEqual(self.path.read_bytes(), before)
+            result_file.write_text(json.dumps(result_for(value, unit, "confirmed")))
+            self.cli("record", "--unit", unit["id"], "--token", revision.token(value, unit), "--file", result_file)
+        value = revision.load(self.path)
+        accept_all(value)
+        final(value)
+        revision.save(self.path, value)
+        output = self.root / "output.md"
+        self.cli("finish", "--output", output)
+        self.assertTrue(output.read_bytes().startswith(b"\xef\xbb\xbf"))
+
     def test_new_state_remains_readable_under_umasks_that_remove_owner_permissions(self):
         for mask in (0o700, 0o777):
             with self.subTest(umask=mask):

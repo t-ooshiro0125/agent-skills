@@ -478,6 +478,11 @@ def expression_view(state, expression):
             "review_current": expression_review_current(state, expression)}
 
 
+def unit_changed(unit):
+    return (unit["inherited_change"] or unit["text"] != unit["initial_text"]
+            or any(entry.get("action") == "edit" for entry in unit["history"]))
+
+
 def make_unit(state, text, kind, parents=()):
     uid = f"u{state['next_id']:04d}"
     state["next_id"] += 1
@@ -612,6 +617,7 @@ def refresh(state):
         review = unit.get("review")
         if unit["state"] in TERMINAL and (not isinstance(review, dict) or
                 review.get("token") != token(state, unit)
+                or (unit["state"] == "unchanged" and unit_changed(unit))
                 or review.get("expression_reviews", {}) != expression_fingerprints(state, unit)
                 or any(not expression_review_current(state, e) for e in expressions_for(state, unit))):
             unit["state"] = "recheck"
@@ -881,6 +887,8 @@ def edit(state, uid, expected, text, affected=(), all_affected=False):
         raise RevisionError("record the check of the last edit before editing again")
     impacted = [unit_by_id(state, item) for item in affected]
     proposed = [{**u, "text": text} if u is unit else u for u in state["units"]]
+    if render(state).startswith("\ufeff") != "".join(u["text"] for u in proposed).startswith("\ufeff"):
+        raise RevisionError("keep the leading BOM unchanged when editing")
     if split_structure_shapes(state["units"]) != split_structure_shapes(proposed):
         raise RevisionError("preserve split table/list structure; merge the whole structure before changing it")
     candidates = blocks(text)
@@ -894,6 +902,7 @@ def edit(state, uid, expected, text, affected=(), all_affected=False):
                          if other["id"] not in changed_ids}
     unit["history"].append({"action": "edit", "text": unit["text"], "token": expected})
     unit["text"], unit["kind"], unit["state"], unit["awaiting_review"] = text, kind, "recheck", True
+    unit["inherited_change"] = True
     unit["generation"] += 1
     for other in impacted:
         if other is not unit:
@@ -968,7 +977,7 @@ def record_review(state, uid, expected, record):
     outcome = record["outcome"]
     if unit["attempts"] >= state["max_iterations"] and outcome != "held":
         raise RevisionError("iteration limit reached: only a documented hold may be recorded")
-    if outcome == "unchanged" and (unit["text"] != unit["initial_text"] or unit["inherited_change"]):
+    if outcome == "unchanged" and unit_changed(unit):
         raise RevisionError("modified text cannot be recorded as unchanged")
     attempts = unit["attempts"] + 1
     if outcome == "needs_revision" and attempts >= state["max_iterations"]:
@@ -1128,7 +1137,7 @@ def split_unit(state, uid, expected, parts):
         child["plan"] = copy.deepcopy(unit["plan"])
         child["context_ids"] = list(dict.fromkeys(unit["context_ids"] + neighbors))
         child["attempts"] = unit["attempts"]
-        child["inherited_change"] = unit["inherited_change"] or unit["text"] != unit["initial_text"]
+        child["inherited_change"] = unit_changed(unit)
         children.append(child)
     if unit["kind"] == "table":
         for child in children[1:]:
@@ -1176,7 +1185,7 @@ def merge_units(state, ids):
             new["plan"] = None
     new["context_ids"] = list(dict.fromkeys(r for u in old for r in u["context_ids"] if r not in ids))
     new["attempts"] = max(u["attempts"] for u in old)
-    new["inherited_change"] = any(u["inherited_change"] or u["text"] != u["initial_text"] for u in old)
+    new["inherited_change"] = any(unit_changed(u) for u in old)
     replace_units(state, old, [new], f"merge {','.join(ids)}")
     return new["id"]
 
@@ -1255,7 +1264,7 @@ def reorder(state, ids):
             structure = "table headers and rows" if kind == "table_open" else "list items"
             raise RevisionError(f"keep split {structure} together in order; merge the structure before reordering its parts")
     ordered = [unit_by_id(state, uid) for uid in ids]
-    if render(state).startswith("\ufeff") and not "".join(u["text"] for u in ordered).startswith("\ufeff"):
+    if render(state).startswith("\ufeff") != "".join(u["text"] for u in ordered).startswith("\ufeff"):
         raise RevisionError("keep the leading BOM at the start of the document when reordering")
     if Counter(spans) != Counter(table_and_list_spans(ordered)):
         raise RevisionError("reorder must preserve table and list boundaries")
@@ -1285,6 +1294,8 @@ def blocking_issues(state):
             validate_record(review["record"], criteria, expression_statuses(state, unit))
             if review["criteria"] != criteria or review["record"]["outcome"] != unit["state"]:
                 raise RevisionError("record does not match current criteria/state")
+            if review["record"]["outcome"] == "unchanged" and unit_changed(unit):
+                raise RevisionError("modified text cannot be recorded as unchanged")
             if review.get("expression_reviews", {}) != expression_fingerprints(state, unit):
                 raise RevisionError("expression results changed after the unit check")
         except RevisionError as error:
