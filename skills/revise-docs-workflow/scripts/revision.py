@@ -583,6 +583,8 @@ def blocking_issues(state):
 
 
 def final_review(state, expected, record):
+    if not isinstance(record, dict):
+        raise RevisionError("full-document review record must be an object")
     if expected != document_token(state):
         raise RevisionError("stale document token")
     issues = blocking_issues(state)

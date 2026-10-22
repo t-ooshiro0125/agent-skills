@@ -510,6 +510,23 @@ class CliTests(unittest.TestCase):
         self.assertEqual(output.read_bytes(), self.original.read_bytes())
         self.assertTrue(json.loads(report.read_text())["fully_resolved"])
 
+    def test_final_review_rejects_non_object_json_without_changing_state(self):
+        self.cli("init", "--original", self.original, "--brief", self.brief)
+        value = revision.load(self.path)
+        accept_all(value)
+        revision.save(self.path, value)
+        token = revision.document_token(value)
+        before = self.path.read_bytes()
+        record_file = self.root / "final-review.json"
+        for invalid in ([], "text", None, 42, True):
+            with self.subTest(value=invalid):
+                record_file.write_text(json.dumps(invalid))
+                result = self.cli("final-review", "--token", token, "--file", record_file,
+                                  success=False)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertIn("must be an object", result.stderr)
+                self.assertEqual(self.path.read_bytes(), before)
+
     def test_cli_rejects_state_overwrite_bad_split_and_stale_edit(self):
         self.cli("init", "--original", self.original, "--brief", self.brief)
         before = self.path.read_bytes()
