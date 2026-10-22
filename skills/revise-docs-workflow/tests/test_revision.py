@@ -103,13 +103,14 @@ class SegmentationTests(unittest.TestCase):
     def test_inline_markdown_cannot_be_split_inside_its_syntax(self):
         for markup in ("`--option`", "``a`b``", "`a\nb`", "[案内](https://example.test/path)",
                        "![図](https://example.test/image)", "<https://example.test/path>",
-                       "**強調**", "*強調*", "\\*", "&amp;", "[案内][ref]"):
+                       "**強調**", "*強調*", "\\*", "&amp;", "[案内][ref]", "  \n", "\\\n"):
             text = "[ref]: https://example.test/reference\n\n前" + markup + "後。\n"
-            value = state(text)
-            unit = next(u for u in value["units"] if u["text"].startswith("前"))
-            start = unit["text"].index(markup)
+            original = state(text)
             for index in range(1, len(markup)):
                 with self.subTest(markup=markup, index=index):
+                    value = copy.deepcopy(original)
+                    unit = next(u for u in value["units"] if u["text"].startswith("前"))
+                    start = unit["text"].index(markup)
                     cut = start + index
                     before = copy.deepcopy(value)
                     with self.assertRaises(revision.RevisionError):

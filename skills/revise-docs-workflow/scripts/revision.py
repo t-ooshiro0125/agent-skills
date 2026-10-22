@@ -861,7 +861,7 @@ def inline_signature(parts, environment):
             if node.type != "inline":
                 continue
             for child in node.children or []:
-                if child.type in {"softbreak", "hardbreak"}:
+                if child.type == "softbreak":
                     continue
                 if child.type == "text":
                     content = "".join(child.content.split())
