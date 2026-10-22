@@ -565,8 +565,8 @@ class ReviewTests(unittest.TestCase):
                 self.assertFalse(revision.has_active_hold(unit))
 
     def test_mixed_held_and_revision_checks_require_explicit_invalidation(self):
-        for legacy_without_marker in (False, True):
-            with self.subTest(legacy_without_marker=legacy_without_marker):
+        for legacy_marker in ("current", "absent", "false"):
+            with self.subTest(legacy_marker=legacy_marker):
                 value = state("対象。\n")
                 unit = value["units"][0]
                 mixed = result_for(value, unit, "held")
@@ -575,8 +575,11 @@ class ReviewTests(unittest.TestCase):
                 revision.record_review(value, unit["id"], revision.token(value, unit), mixed)
                 self.assertEqual(unit["state"], "recheck")
                 self.assertTrue(unit["hold_active"])
-                if legacy_without_marker:
+                if legacy_marker == "absent":
                     del unit["hold_active"]
+                elif legacy_marker == "false":
+                    unit["hold_active"] = False
+                    unit.pop("hold_released_token", None)
                 self.assertTrue(revision.has_active_hold(unit))
                 before = copy.deepcopy(value)
                 for operation in (
@@ -588,12 +591,37 @@ class ReviewTests(unittest.TestCase):
                 with self.assertRaises(revision.RevisionError):
                     revision.finish(value)
                 revision.invalidate(value, [unit["id"]], "保留していた判断を得たので残る修正を行う")
+                self.assertEqual(unit["hold_released_token"], before["units"][0]["review"]["token"])
                 revision.edit(value, unit["id"], revision.token(value, unit), "明示した条件。\n")
                 revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit, "confirmed"))
                 self.assertFalse(revision.has_active_hold(unit))
+                self.assertIsNone(unit["hold_released_token"])
                 self.assertIn(before["units"][0]["history"][-1], unit["history"])
                 final(value)
                 self.assertTrue(revision.finish(value)["fully_resolved"])
+
+    def test_release_is_bound_to_the_held_review_and_survives_context_changes(self):
+        value = state("対象。\n")
+        unit = value["units"][0]
+        revision.record_review(value, unit["id"], revision.token(value, unit), hold())
+        first_token = unit["review"]["token"]
+        revision.invalidate(value, [unit["id"]], "必要な判断を得て再開する")
+        self.assertEqual(unit["hold_released_token"], first_token)
+        brief = copy.deepcopy(value["brief"])
+        brief["reader"] += "。確認対象の用語は別途説明する"
+        revision.update_brief(value, brief)
+        self.assertFalse(revision.has_active_hold(unit))
+        revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit, "held"))
+        self.assertNotEqual(unit["review"]["token"], first_token)
+        brief = copy.deepcopy(value["brief"])
+        brief["purpose"] += "。条件を再点検する"
+        revision.update_brief(value, brief)
+        self.assertEqual(unit["state"], "recheck")
+        unit["hold_active"] = False
+        unit["hold_released_token"] = first_token
+        self.assertTrue(revision.has_active_hold(unit))
+        with self.assertRaisesRegex(revision.RevisionError, "held.*invalidate"):
+            revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit))
 
     def test_regrouping_does_not_turn_edited_text_into_unchanged(self):
         value = state()
@@ -1055,6 +1083,39 @@ class CliTests(unittest.TestCase):
         shown = json.loads(self.cli("show", "--unit", unit["id"]).stdout)["target"]
         self.assertFalse(shown["hold_active"])
         self.cli("record", "--unit", unit["id"], "--token", shown["token"], "--file", result_file)
+
+    def test_cli_old_false_marker_does_not_override_a_persisted_held_check(self):
+        value = state("対象。\n")
+        unit = value["units"][0]
+        mixed = result_for(value, unit, "held")
+        mixed["outcome"] = "needs_revision"
+        mixed["checks"][1].update(status="needs_revision", observation="対象と条件を明示する必要がある")
+        revision.record_review(value, unit["id"], revision.token(value, unit), mixed)
+        unit["hold_active"] = False
+        unit.pop("hold_released_token", None)
+        self.path.write_text(json.dumps(value))
+        shown = json.loads(self.cli("show", "--unit", unit["id"]).stdout)["target"]
+        self.assertTrue(shown["hold_active"])
+        before = self.path.read_bytes()
+        result_file, edit_file = self.root / "new-result.json", self.root / "edit.md"
+        result_file.write_text(json.dumps(result_for(value, unit)))
+        edit_file.write_text("条件を明示した説明。\n")
+        self.cli("record", "--unit", unit["id"], "--token", shown["token"], "--file", result_file, success=False)
+        self.cli("edit", "--unit", unit["id"], "--token", shown["token"], "--file", edit_file, success=False)
+        self.assertEqual(self.path.read_bytes(), before)
+        old_token = unit["review"]["token"]
+        self.cli("invalidate", "--units", unit["id"], "--reason", "不足していた情報と判断を確認できた")
+        current = revision.load(self.path)
+        self.assertEqual(current["units"][0]["hold_released_token"], old_token)
+        shown = json.loads(self.cli("show", "--unit", unit["id"]).stdout)["target"]
+        self.assertFalse(shown["hold_active"])
+        self.cli("record", "--unit", unit["id"], "--token", shown["token"], "--file", result_file)
+        current = revision.load(self.path)
+        final(current)
+        revision.save(self.path, current)
+        report = self.root / "report.json"
+        self.cli("finish", "--output", self.root / "revised.md", "--report", report)
+        self.assertTrue(json.loads(report.read_text())["fully_resolved"])
 
     def test_regrouping_blocks_held_and_unchecked_edits_without_rewriting_state(self):
         for operation in ("split", "merge"):

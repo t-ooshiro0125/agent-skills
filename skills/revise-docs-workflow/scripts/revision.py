@@ -300,7 +300,7 @@ def upgrade(state, brief, max_iterations=None):
                              "previous_max_iterations": state["max_iterations"],
                              "max_iterations": limit})
     for unit in result["units"]:
-        unit["hold_active"] = unit["state"] == "held"
+        unit["hold_active"] = has_active_hold(unit)
         unit["history"].append({"action": "legacy_review", "review": copy.deepcopy(unit["review"])})
         unit["plan"], unit["review"], unit["state"] = None, None, "recheck"
         unit["generation"] += 1
@@ -404,12 +404,15 @@ def check_token(state, unit, expected):
 
 def has_active_hold(unit):
     review = unit.get("review")
-    record = review.get("record", {}) if isinstance(review, dict) else {}
+    record = review.get("record", review) if isinstance(review, dict) else {}
     checks = record.get("checks", []) if isinstance(record, dict) else []
     previous_hold = (isinstance(record, dict) and record.get("outcome") == "held") or (
         isinstance(checks, list) and any(isinstance(check, dict) and check.get("status") == "held"
                                         for check in checks))
-    return unit["state"] == "held" or unit.get("hold_active", previous_hold)
+    released_token = unit.get("hold_released_token")
+    released = (released_token is not None and isinstance(review, dict)
+                and released_token == review.get("token"))
+    return unit["state"] == "held" or unit.get("hold_active", False) or (previous_hold and not released)
 
 
 def view(state, unit):
@@ -500,6 +503,8 @@ def invalidate(state, ids, reason, *, reopen_holds=True):
         unit["state"] = "recheck"
         if reopen_holds:
             unit["hold_active"] = False
+            review = unit.get("review")
+            unit["hold_released_token"] = review.get("token") if isinstance(review, dict) else None
     touch(state, reason)
 
 
@@ -612,6 +617,7 @@ def record_review(state, uid, expected, record):
     unit["history"].append({"action": "review", **copy.deepcopy(review)})
     unit["awaiting_review"] = False
     unit["hold_active"] = any(check["status"] == "held" for check in saved["checks"])
+    unit["hold_released_token"] = None
     unit["state"] = "recheck" if outcome == "needs_revision" else outcome
     state["final_review"] = None
 
