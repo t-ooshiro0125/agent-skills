@@ -468,8 +468,27 @@ def status(state):
 
 def next_target(state):
     refresh(state)
-    unit = next((u for u in state["units"] if u["state"] not in TERMINAL), None)
+    unit = next((u for u in state["units"] if u["state"] not in TERMINAL and not has_active_hold(u)), None)
     return view(state, unit) if unit else {"target": None, **status(state)}
+
+
+def migrate_release(state, uid, expected, review_token, evidence):
+    unit = unit_by_id(state, uid)
+    check_token(state, unit, expected)
+    require_text(evidence, "evidence of the previous explicit invalidation")
+    review = unit.get("review")
+    if ("hold_released_token" in unit or unit.get("hold_active", False) is not False
+            or unit["state"] != "recheck" or not has_active_hold(unit)):
+        raise RevisionError("release migration requires a legacy, cleared hold without release metadata")
+    if not isinstance(review, dict) or not review_token or review.get("token") != review_token:
+        raise RevisionError("stale held review token")
+    if expected == review_token:
+        raise RevisionError("the held review is still current; use invalidate with new information/decision")
+    unit["hold_active"] = False
+    unit["hold_released_token"] = review_token
+    unit["history"].append({"action": "migrate_release", "token": expected, "review_token": review_token,
+                            "evidence": evidence})
+    touch(state, f"migrated previous explicit hold release for {uid}")
 
 
 def annotate(state, uid, expected, data):
@@ -859,6 +878,11 @@ def parser():
     extend = sub.add_parser("extend-limit")
     extend.add_argument("--max-iterations", required=True, type=int)
     extend.add_argument("--reason", required=True)
+    release = sub.add_parser("migrate-release")
+    release.add_argument("--unit", required=True)
+    release.add_argument("--token", required=True)
+    release.add_argument("--review-token", required=True)
+    release.add_argument("--evidence", required=True)
     sub.add_parser("next")
     sub.add_parser("status")
     show = sub.add_parser("show")
@@ -955,6 +979,9 @@ def main(argv=None):
             elif command == "extend-limit":
                 extend_limit(state, args.max_iterations, args.reason)
                 result = status(state)
+            elif command == "migrate-release":
+                migrate_release(state, args.unit, args.token, args.review_token, args.evidence)
+                result = view(state, unit_by_id(state, args.unit))
             elif command == "final-review":
                 final_review(state, args.token, read_json(args.file))
                 result = status(state)

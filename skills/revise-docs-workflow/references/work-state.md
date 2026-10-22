@@ -57,7 +57,7 @@ python3 revision.py --state work.json reorder --units u0001 u0005 u0006
 
 ## 対象を読み、計画を登録する
 
-`next` は未処理または再確認待ちを一つ返す。`target` の本文・計画・`required_criteria` と、`reference_only` の依頼条件・見出し・前後・関連箇所・メモを読む。`previous_review` は過去の結果で、現行版に使えるとは限らない。必要な文脈が不足すれば原文・全文・任意の対象や履歴へ戻る。
+`next` は未処理または再確認待ちを一つ返す。`hold_active` のある対象は、文脈変更で状態が `recheck` になった場合も候補から外し、他の対象を進める。`target` の本文・計画・`required_criteria` と、`reference_only` の依頼条件・見出し・前後・関連箇所・メモを読む。`previous_review` は過去の結果で、現行版に使えるとは限らない。必要な文脈が不足すれば原文・全文・任意の対象や履歴へ戻る。
 
 ```sh
 python3 revision.py --state work.json show --document original
@@ -187,5 +187,14 @@ python3 revision.py --state work.json upgrade --brief brief.json
 ```
 
 移行と同時に上限を増やす場合は `upgrade --max-iterations` を使う。移行後の形式2には前述の `extend-limit` を使い、いずれも過去の回数は消さない。旧状態・作業ログ・原文などは指定された公開範囲に従って保持する。記録の充足と、依頼者が理解できる修正文になったかは別に確認する。
+
+旧形式2で解除済みの対象には、解除した確認記録の版が保存されていない場合がある。偽フラグのまま未解除の状態もあるため、フラグだけで解除済みとは判断しない。旧実行ログなどで、その対象への理由付きの `invalidate` と解除の根拠を確認できた場合は、`migrate-release` で既存の解除を移行する。新たな `invalidate` は不要で、本文・状態・対象ID・世代・反復回数・既存の確認記録を保ち、移行根拠を履歴へ追加する。
+
+```sh
+python3 revision.py --state work.json show --unit u0004
+python3 revision.py --state work.json migrate-release --unit u0004 --token CURRENT_TOKEN --review-token HELD_REVIEW_TOKEN --evidence "旧実行ログの対象・解除理由・根拠を確認した箇所"
+```
+
+`CURRENT_TOKEN` は現在の対象、`HELD_REVIEW_TOKEN` は `previous_review` にある保留記録のtokenを使う。移行は解除記録のない旧状態に限定し、現在と同じ版の保留・版の不一致・根拠の空欄は拒否する。形式や版の検査で過去の明示解除を証明できるわけではなく、根拠の確認は担当者が行う。確認できなければ保留を維持し、新しい情報・判断を得た場合は通常の `invalidate` を使う。
 
 補助スクリプトの変更時は、依存導入済みの環境でスキルディレクトリから `python3 tests/test_revision.py` を実行する。
