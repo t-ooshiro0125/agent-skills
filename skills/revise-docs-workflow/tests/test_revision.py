@@ -2012,6 +2012,68 @@ class ExpressionTrackingTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_new_state_remains_readable_under_umasks_that_remove_owner_permissions(self):
+        for mask in (0o700, 0o777):
+            with self.subTest(umask=mask):
+                self.path = self.root / f"state-{mask}.json"
+                self.cli("init", "--original", self.original, "--brief", self.brief, umask=mask)
+                self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
+                self.cli("status", umask=mask)
+                self.cli("next", umask=mask)
+                self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
+
+    def test_missing_destination_identity_matches_native_filesystem_names(self):
+        cases = [("revised.md", "REVISED.md"), ("a.md", "b.md"), ("é.md", "e\u0301.md"),
+                 ("ß.md", "ss.md"), ("new/out.md", "NEW/OUT.md")]
+        for first, second in cases:
+            with self.subTest(first=first, second=second):
+                with tempfile.TemporaryDirectory(dir=self.root) as oracle_directory:
+                    oracle = Path(oracle_directory)
+                    a, b = oracle / first, oracle / second
+                    a.parent.mkdir(parents=True, exist_ok=True)
+                    a.touch()
+                    expected = b.exists() and a.samefile(b)
+                before = set(self.root.iterdir())
+                self.assertEqual(revision.same_destination(self.root / first, self.root / second), expected)
+                self.assertEqual(set(self.root.iterdir()), before)
+
+    def test_cli_rejects_case_alias_outputs_and_state_on_insensitive_filesystems(self):
+        if not revision.same_destination(self.root / "revised.md", self.root / "REVISED.md"):
+            self.skipTest("requires a filesystem with case-insensitive file names")
+        value = state("対象。\n")
+        accept_all(value)
+        final(value)
+        revision.save(self.path, value)
+        before, files = self.path.read_bytes(), set(self.root.iterdir())
+        for output, report in ((self.root / "revised.md", self.root / "REVISED.md"),
+                               (self.root / "new/out.md", self.root / "NEW/OUT.md")):
+            self.cli("finish", "--output", output, "--report", report, success=False)
+            self.assertEqual(self.path.read_bytes(), before)
+            self.assertEqual(set(self.root.iterdir()), files)
+        output = self.root / "revised.md"
+        output.write_text("original output")
+        self.cli("finish", "--output", output, "--report", self.root / "REVISED.md", success=False)
+        self.assertEqual(output.read_text(), "original output")
+        self.cli("finish", "--output", self.path.with_name(self.path.name.upper()), success=False)
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_cli_rejects_hardlink_aliases_of_outputs_and_state(self):
+        value = state("対象。\n")
+        accept_all(value)
+        final(value)
+        revision.save(self.path, value)
+        before = self.path.read_bytes()
+        output, report = self.root / "output.md", self.root / "report.json"
+        output.write_text("original output")
+        report.hardlink_to(output)
+        self.cli("finish", "--output", output, "--report", report, success=False)
+        self.assertEqual(output.read_text(), "original output")
+        self.assertEqual(report.read_text(), "original output")
+        alias = self.root / "state-alias.json"
+        alias.hardlink_to(self.path)
+        self.cli("finish", "--output", alias, success=False)
+        self.assertEqual(self.path.read_bytes(), before)
+
     def test_cli_rejects_old_overwritten_unit_holds_without_saving(self):
         value, unit = legacy_overwritten_unit_hold()
         self.path.write_text(json.dumps(value))

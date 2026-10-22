@@ -14,6 +14,7 @@ import secrets
 import stat
 import subprocess
 import sys
+import tempfile
 
 
 try:
@@ -63,6 +64,44 @@ def read_json(path):
     return json.loads(read_text(path))
 
 
+def same_destination(left, right):
+    left, right = Path(left).resolve(), Path(right).resolve()
+    if left == right:
+        return True
+    if left.exists() or right.exists():
+        return left.exists() and right.exists() and left.samefile(right)
+
+    def missing_parts(path):
+        parts = []
+        while not path.exists():
+            parts.append(path.name)
+            path = path.parent
+        return path, list(reversed(parts))
+
+    first_parent, first_parts = missing_parts(left)
+    second_parent, second_parts = missing_parts(right)
+    if not first_parent.samefile(second_parent):
+        return False
+    # Probe actual name equivalence, including missing directories and Unicode,
+    # without creating or replacing either destination.
+    with tempfile.TemporaryDirectory(prefix=".revision-check-", dir=first_parent) as directory:
+        probe = Path(directory)
+        probe.chmod(0o700)
+        first, second = probe.joinpath(*first_parts), probe.joinpath(*second_parts)
+        parent = probe
+        for part in first_parts[:-1]:
+            parent /= part
+            parent.mkdir(mode=0o700)
+            parent.chmod(0o700)
+        descriptor = os.open(first, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(descriptor)
+        return second.exists() and first.samefile(second)
+
+
+def distinct_destinations(paths):
+    return all(not same_destination(left, right) for index, left in enumerate(paths) for right in paths[index + 1:])
+
+
 def stage_file(path, data, *, new_mode=0o600):
     path = Path(path)
     if path.is_symlink():
@@ -71,6 +110,8 @@ def stage_file(path, data, *, new_mode=0o600):
         raise RevisionError(f"destination must be a regular file: {path}")
     if path.exists():
         mode = stat.S_IMODE(path.stat().st_mode)
+    elif new_mode == 0o600:
+        mode = 0o600
     else:
         # Read the inherited umask in a child without changing the parent's mask.
         mask = int(subprocess.check_output(
@@ -1463,7 +1504,7 @@ def main(argv=None):
                 outputs = [args.output] + ([args.report] if args.report else [])
                 if any(path.is_symlink() for path in outputs + [args.state]):
                     raise RevisionError("refusing symbolic-link output/state paths; specify regular files")
-                if len({p.resolve() for p in outputs + [args.state]}) != len(outputs) + 1:
+                if not distinct_destinations(outputs + [args.state]):
                     raise RevisionError("output, report, and state paths must be distinct")
                 result = finish(state)
                 outputs = [(args.output, result.pop("text"))]
