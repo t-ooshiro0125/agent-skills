@@ -1519,6 +1519,25 @@ class ReviewTests(unittest.TestCase):
         for unit in value["units"][:2]:
             self.assertEqual(revision.view(value, unit)["target"]["original_scope"], "whole_document")
 
+    def test_original_mapping_does_not_join_across_deleted_source_blocks(self):
+        original = "Before begin.\n\nOther begin.\n\nEnd unrelated.\n\nEnd after.\n\n"
+        working = "Before begin.\n\nEnd after.\n\n"
+        value = revision.initialize(original, working, BRIEF)
+        for unit in value["units"]:
+            ensure_plan(value, unit)
+            self.assertEqual(revision.view(value, unit)["target"]["original_scope"], "matching_excerpt")
+        merged_id = revision.merge_units(value, [u["id"] for u in value["units"]])
+        merged = revision.unit_by_id(value, merged_id)
+        ids = revision.split_unit(value, merged_id, revision.token(value, merged),
+                                  ["Before ", "begin.\n\nEnd ", "after.\n\n"])
+        middle = revision.view(value, revision.unit_by_id(value, ids[1]))["target"]
+        self.assertEqual(middle["original_scope"], "whole_document")
+        self.assertEqual(middle["original_text"], original)
+        for uid, text in ((ids[0], "Before "), (ids[2], "after.\n\n")):
+            shown = revision.view(value, revision.unit_by_id(value, uid))["target"]
+            self.assertEqual(shown["original_scope"], "matching_excerpt")
+            self.assertEqual(shown["original_text"], text)
+
     def test_initial_original_alignment_is_cached_across_target_views_and_revisions(self):
         original = "Cache first.\n\nCache second.\n\nCache last.\n"
         working = original.replace("second", "revised")

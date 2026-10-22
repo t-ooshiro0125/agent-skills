@@ -543,7 +543,7 @@ def upgrade(state, brief, max_iterations=None):
 def original_match_ranges(original, working):
     """Locate unchanged initial blocks without matching a draft to an unrelated excerpt."""
     if original == working:
-        return ((0,), (len(working),))
+        return ((0,), (len(working),), (0,))
     source = [block["text"] for block in blocks(original)]
     draft = [block["text"] for block in blocks(working)]
     if len(source) == len(draft):
@@ -562,17 +562,24 @@ def original_match_ranges(original, working):
         if len(pairs) < 2:
             pairs = []
     source_counts, draft_counts = Counter(source), Counter(draft)
-    matches = {j for i, j in pairs if source_counts[source[i]] == draft_counts[draft[j]] == 1}
+    source_starts, offset = [], 0
+    for text in source:
+        source_starts.append(offset)
+        offset += len(text)
+    matches = {j: source_starts[i] for i, j in pairs
+               if source_counts[source[i]] == draft_counts[draft[j]] == 1}
     ranges, offset = [], 0
     for index, text in enumerate(draft):
         end = offset + len(text)
         if index in matches:
-            if ranges and ranges[-1][1] == offset:
-                ranges[-1] = (ranges[-1][0], end)
+            source_start = matches[index]
+            if (ranges and ranges[-1][1] == offset
+                    and ranges[-1][2] + ranges[-1][1] - ranges[-1][0] == source_start):
+                ranges[-1] = (ranges[-1][0], end, ranges[-1][2])
             else:
-                ranges.append((offset, end))
+                ranges.append((offset, end, source_start))
         offset = end
-    return tuple(first for first, _ in ranges), tuple(last for _, last in ranges)
+    return tuple(zip(*ranges)) if ranges else ((), (), ())
 
 
 def layout(state):
@@ -818,13 +825,14 @@ def matching_original_excerpt(state, unit):
     if unit_changed(unit):
         return False
     text, working, original = unit["initial_text"], state["initial_working"], state["original"]
-    start = working.find(text)
-    if (start < 0 or start != working.rfind(text) or original.find(text) < 0
-            or original.find(text) != original.rfind(text)):
+    start, source_start = working.find(text), original.find(text)
+    if (start < 0 or start != working.rfind(text) or source_start < 0
+            or source_start != original.rfind(text)):
         return False
-    starts, ends = layout(state)["original_matches"]
+    starts, ends, source_starts = layout(state)["original_matches"]
     index = bisect_right(starts, start) - 1
-    return index >= 0 and start + len(text) <= ends[index]
+    return (index >= 0 and start + len(text) <= ends[index]
+            and source_start == source_starts[index] + start - starts[index])
 
 
 def history(state, uid):
