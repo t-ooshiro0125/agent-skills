@@ -404,8 +404,11 @@ def check_token(state, unit, expected):
 
 def has_active_hold(unit):
     review = unit.get("review")
-    previous_hold = (isinstance(review, dict) and isinstance(review.get("record"), dict)
-                     and review["record"].get("outcome") == "held")
+    record = review.get("record", {}) if isinstance(review, dict) else {}
+    checks = record.get("checks", []) if isinstance(record, dict) else []
+    previous_hold = (isinstance(record, dict) and record.get("outcome") == "held") or (
+        isinstance(checks, list) and any(isinstance(check, dict) and check.get("status") == "held"
+                                        for check in checks))
     return unit["state"] == "held" or unit.get("hold_active", previous_hold)
 
 
@@ -608,7 +611,7 @@ def record_review(state, uid, expected, record):
     unit["review"] = review
     unit["history"].append({"action": "review", **copy.deepcopy(review)})
     unit["awaiting_review"] = False
-    unit["hold_active"] = outcome == "held"
+    unit["hold_active"] = any(check["status"] == "held" for check in saved["checks"])
     unit["state"] = "recheck" if outcome == "needs_revision" else outcome
     state["final_review"] = None
 

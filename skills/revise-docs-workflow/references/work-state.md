@@ -133,7 +133,7 @@ python3 revision.py --state work.json invalidate --all --reason "共通の前提
 python3 revision.py --state work.json brief --file revised-brief.json
 ```
 
-一回の修正を確認する前に同じ対象へ次の修正はできない。保留は `next` で飛ばして他を進める。保留結果は直接上書きできず、新しい根拠や判断を得た対象を理由付きの `invalidate` で再確認待ちへ戻してから記録する。文脈変更などで状態が `recheck` になっても、`hold_active` が残る対象は、明示的な `invalidate` まで結果の再保存・編集・分割・結合を拒否する。`target` と `status` の対象一覧でこの阻止状態も確認できる。
+一回の修正を確認する前に同じ対象へ次の修正はできない。保留は `next` で飛ばして他を進める。保留結果は直接上書きできず、新しい根拠や判断を得た対象を理由付きの `invalidate` で再確認待ちへ戻してから記録する。個別の基準に `held` が一つでもあれば、他の基準が `needs_revision` で全体が `recheck` の場合にも `hold_active` を保持する。文脈変更などで状態が `recheck` になっても、`hold_active` が残る対象は、明示的な `invalidate` まで結果の再保存・編集・分割・結合を拒否する。`target` と `status` の対象一覧でこの阻止状態も確認できる。
 
 反復上限でまだ `needs_revision` の基準がある場合、具体案・理由・必要な判断が揃うまで記録を受け付けず、揃ったら `held` として保存する。上限到達を合格にせず、上限のままでは追加修正せずに残る案を報告する。
 
