@@ -40,24 +40,66 @@ def read_json(path):
     return json.loads(read_text(path))
 
 
-def write_atomic(path, text):
+def stage_file(path, data):
     path = Path(path)
     if path.is_symlink():
         raise RevisionError("refusing to replace a symbolic link; specify the intended regular file")
+    if path.exists() and not path.is_file():
+        raise RevisionError(f"destination must be a regular file: {path}")
     mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else None
     path.parent.mkdir(parents=True, exist_ok=True)
     name = None
     try:
         with tempfile.NamedTemporaryFile("wb", dir=path.parent, delete=False) as stream:
             name = stream.name
-            stream.write(text.encode("utf-8"))
+            stream.write(data)
             stream.flush()
             if mode is not None:
                 os.fchmod(stream.fileno(), mode)
-        os.replace(name, path)
-    finally:
+        return name
+    except BaseException:
         if name and os.path.exists(name):
             os.unlink(name)
+        raise
+
+
+def write_many_atomic(outputs):
+    """Stage every output first and restore committed files on replacement errors."""
+    staged, backups, committed, recovery = [], {}, [], set()
+    try:
+        for path, text in outputs:
+            path = Path(path)
+            staged.append((path, stage_file(path, text.encode("utf-8"))))
+        if len(staged) > 1:
+            for path, _ in staged:
+                backups[path] = stage_file(path, path.read_bytes()) if path.exists() else None
+        for path, name in staged:
+            os.replace(name, path)
+            committed.append(path)
+    except OSError as error:
+        failures = []
+        for path in reversed(committed):
+            backup = backups.get(path)
+            try:
+                if backup:
+                    os.replace(backup, path)
+                else:
+                    path.unlink()
+            except OSError as restore_error:
+                if backup:
+                    recovery.add(backup)
+                failures.append(f"{path}: {restore_error}; recovery copy: {backup}")
+        if failures:
+            raise RevisionError("output restoration failed: " + "; ".join(failures)) from error
+        raise
+    finally:
+        for name in [name for _, name in staged] + list(backups.values()):
+            if name and name not in recovery and os.path.exists(name):
+                os.unlink(name)
+
+
+def write_atomic(path, text):
+    write_many_atomic([(path, text)])
 
 
 def table_start(lines, i):
@@ -705,12 +747,14 @@ def main(argv=None):
                 if len({p.resolve() for p in outputs + [args.state]}) != len(outputs) + 1:
                     raise RevisionError("output, report, and state paths must be distinct")
                 result = finish(state)
-                write_atomic(args.output, result.pop("text"))
+                outputs = [(args.output, result.pop("text"))]
                 if args.report:
-                    write_atomic(args.report, json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+                    outputs.append((args.report, json.dumps(result, ensure_ascii=False, indent=2) + "\n"))
+                write_many_atomic(outputs)
             else:
                 raise RevisionError("unsupported command")
-        save(args.state, state)
+        if args.command != "finish":
+            save(args.state, state)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     except (OSError, UnicodeError, ValueError, KeyError, TypeError) as error:

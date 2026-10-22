@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "revision.py"
@@ -411,6 +412,7 @@ class CliTests(unittest.TestCase):
         normal.write_text("既存文書")
         self.cli("finish", "--output", normal, "--report", output, success=False)
         self.assertEqual(normal.read_text(), "既存文書")
+
         self.assertTrue(output.is_symlink())
         with self.assertRaises(revision.RevisionError):
             revision.write_atomic(output, "置換しない")
@@ -422,6 +424,77 @@ class CliTests(unittest.TestCase):
         self.assertTrue(self.path.is_symlink())
         self.assertEqual(backing.read_bytes(), before)
         self.assertEqual(normal.read_text(), "既存文書")
+
+    def test_invalid_report_destination_leaves_document_and_state_unchanged(self):
+        self.cli("init", "--original", self.original, "--brief", self.brief)
+        value = revision.load(self.path)
+        accept_all(value)
+        final(value)
+        revision.save(self.path, value)
+        output = self.root / "output.md"
+        output.write_text("既存の本文")
+        before = self.path.read_bytes()
+        directory = self.root / "report-dir"
+        directory.mkdir()
+        file_parent = self.root / "file-parent"
+        file_parent.write_text("通常ファイル")
+        for report in (directory, file_parent / "report.json"):
+            with self.subTest(report=report):
+                self.cli("finish", "--output", output, "--report", report, success=False)
+                self.assertEqual(output.read_text(), "既存の本文")
+                self.assertEqual(self.path.read_bytes(), before)
+        # A valid finish only reads its already-confirmed state.
+        self.cli("finish", "--output", output, "--report", self.root / "report.json")
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_report_commit_error_restores_existing_document_and_report(self):
+        output, report = self.root / "output.md", self.root / "report.json"
+        output.write_text("既存の本文")
+        output.chmod(0o644)
+        report.write_text("既存のレポート")
+        original_replace = revision.os.replace
+        def replace(source, destination):
+            if Path(destination) == report:
+                raise PermissionError("simulated report replacement failure")
+            return original_replace(source, destination)
+        with patch.object(revision.os, "replace", side_effect=replace):
+            with self.assertRaises(PermissionError):
+                revision.write_many_atomic([(output, "新しい本文"), (report, "新しいレポート")])
+        self.assertEqual(output.read_text(), "既存の本文")
+        self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o644)
+        self.assertEqual(report.read_text(), "既存のレポート")
+        self.assertEqual(set(self.root.iterdir()), {self.original, self.brief, output, report})
+        output.unlink()
+        with patch.object(revision.os, "replace", side_effect=replace):
+            with self.assertRaises(PermissionError):
+                revision.write_many_atomic([(output, "新しい本文"), (report, "新しいレポート")])
+        self.assertFalse(output.exists())
+        self.assertEqual(report.read_text(), "既存のレポート")
+
+    def test_failed_restoration_keeps_recovery_copy_and_reports_its_path(self):
+        output, report = self.root / "output.md", self.root / "report.json"
+        output.write_text("復元すべき本文")
+        report.write_text("既存レポート")
+        original_replace = revision.os.replace
+        document_replacements = 0
+        def replace(source, destination):
+            nonlocal document_replacements
+            if Path(destination) == output:
+                document_replacements += 1
+                if document_replacements > 1:
+                    raise PermissionError("simulated restoration failure")
+            if Path(destination) == report:
+                raise PermissionError("simulated report failure")
+            return original_replace(source, destination)
+        with patch.object(revision.os, "replace", side_effect=replace):
+            with self.assertRaises(revision.RevisionError) as error:
+                revision.write_many_atomic([(output, "新しい本文"), (report, "新しいレポート")])
+        copies = set(self.root.iterdir()) - {self.original, self.brief, output, report}
+        self.assertEqual(len(copies), 1)
+        recovery = copies.pop()
+        self.assertEqual(recovery.read_text(), "復元すべき本文")
+        self.assertIn(str(recovery), str(error.exception))
+        self.assertEqual(report.read_text(), "既存レポート")
 
 
 if __name__ == "__main__":
