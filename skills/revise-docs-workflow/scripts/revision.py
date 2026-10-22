@@ -257,6 +257,162 @@ def extend_limit(state, maximum, reason):
                                 "max_iterations": maximum})
 
 
+def expression_definition(expression):
+    return {key: expression[key] for key in ("id", "source", "goal", "origin", "owners")}
+
+
+def expressions_for(state, unit):
+    return [e for e in state.get("expressions", {}).values() if unit["id"] in e["owners"]]
+
+
+def quote_position(text, quote, start=None):
+    require_text(quote, "quote")
+    if start is None:
+        start = text.find(quote)
+        if start < 0 or start != text.rfind(quote):
+            raise RevisionError("quote must exist uniquely in the current text, or specify start")
+    if type(start) is not int or start < 0 or text[start:start + len(quote)] != quote:
+        raise RevisionError("quote does not exist at the specified position")
+    return start
+
+
+def register_expressions(state, uid, expected, entries):
+    unit = unit_by_id(state, uid)
+    check_token(state, unit, expected)
+    if not isinstance(entries, list) or not entries:
+        raise RevisionError("register a nonempty list of expressions")
+    additions = {}
+    for entry in entries:
+        fields = {"id", "quote", "goal", "origin"}
+        if not isinstance(entry, dict) or set(entry) - {"start"} != fields:
+            raise RevisionError("expression requires id, quote, goal, origin, and optional start; no results")
+        eid = entry["id"]
+        if (not isinstance(eid, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", eid)
+                or eid in additions or eid in state.get("expressions", {})):
+            raise RevisionError("expression IDs must be new, unique stable identifiers")
+        require_text(entry["goal"], "expression understanding goal")
+        if not isinstance(entry["origin"], str) or entry["origin"] not in {"user", "inspection"}:
+            raise RevisionError("expression origin must be user or inspection")
+        start = quote_position(unit["text"], entry["quote"], entry.get("start"))
+        additions[eid] = {"id": eid, "source": {"unit_id": uid, "quote": entry["quote"], "start": start},
+                          "source_text": unit["text"], "goal": entry["goal"], "origin": entry["origin"],
+                          "owners": [uid], "review": None, "history": [], "hold_active": False}
+    state.setdefault("expressions", {}).update(additions)
+    touch(state, f"registered expressions for {uid}")
+
+
+def expression_by_id(state, eid):
+    if eid not in state.get("expressions", {}):
+        raise RevisionError(f"unknown expression: {eid}")
+    return state["expressions"][eid]
+
+
+def expression_version(state, expression):
+    return digest({"definition": expression_definition(expression),
+                   "owners": [token(state, unit_by_id(state, uid)) for uid in expression["owners"]]})
+
+
+def expression_has_hold(expression):
+    review = expression.get("review")
+    return expression.get("hold_active", False) or bool(
+        review and review["record"]["outcome"] == "held"
+        and expression.get("hold_released_version") != review["version"])
+
+
+def unit_has_hold(state, unit):
+    return has_active_hold(unit) or any(expression_has_hold(e) for e in expressions_for(state, unit))
+
+
+def expression_fingerprints(state, unit):
+    return {e["id"]: digest(e["review"]) for e in expressions_for(state, unit)}
+
+
+def validate_expression_record(state, record):
+    fields = {"outcome", "observation", "evidence"}
+    if not isinstance(record, dict) or not fields <= record.keys():
+        raise RevisionError("expression result requires outcome, observation, and current-text evidence")
+    outcome = record["outcome"]
+    if not isinstance(outcome, str) or outcome not in {"explained", "unchanged", "needs_revision", "held"}:
+        raise RevisionError("invalid expression outcome")
+    require_text(record["observation"], "expression observation")
+    if record["observation"].strip().casefold().strip(".。!！") in OPAQUE:
+        raise RevisionError("describe the expression check, not a bare OK")
+    if outcome == "unchanged":
+        fields.add("reason")
+        require_text(record.get("reason"), "why the current explanation is sufficient")
+    elif outcome == "held" or (outcome == "needs_revision" and
+                               set(record) & {"reason", "proposal", "required_decision"}):
+        fields.update({"reason", "proposal", "required_decision"})
+        held_details(record)
+    if set(record) != fields:
+        raise RevisionError("unsupported or missing expression result fields")
+    evidence = record["evidence"]
+    if not isinstance(evidence, list) or not evidence:
+        raise RevisionError("expression result requires quoted evidence in the current document")
+    normalized = copy.deepcopy(record)
+    normalized["evidence"] = []
+    for item in evidence:
+        if not isinstance(item, dict) or set(item) - {"start"} != {"unit_id", "token", "quote"}:
+            raise RevisionError("evidence requires unit_id, token, quote, and optional start")
+        unit = unit_by_id(state, item["unit_id"])
+        check_token(state, unit, item["token"])
+        start = quote_position(unit["text"], item["quote"], item.get("start"))
+        normalized["evidence"].append({**item, "start": start})
+    return normalized
+
+
+def expression_review_current(state, expression):
+    review = expression["review"]
+    if not review or review["version"] != expression_version(state, expression):
+        return False
+    try:
+        validate_expression_record(state, review["record"])
+    except RevisionError:
+        return False
+    return True
+
+
+def expression_statuses(state, unit):
+    statuses = set()
+    for expression in expressions_for(state, unit):
+        if not expression_review_current(state, expression):
+            raise RevisionError(f"{expression['id']}: current-version expression result is required")
+        statuses.add(expression["review"]["record"]["outcome"])
+    return statuses
+
+
+def record_expression(state, eid, expected, record):
+    expression = expression_by_id(state, eid)
+    if expected != expression_version(state, expression):
+        raise RevisionError("stale expression version; retrieve its owners and context again")
+    if expression_has_hold(expression):
+        raise RevisionError("held expression: invalidate an owner with new information/decision before recording")
+    normalized = validate_expression_record(state, record)
+    expression["review"] = {"version": expected, "record": normalized}
+    expression["history"].append({"action": "review", **copy.deepcopy(expression["review"])})
+    expression["hold_active"] = normalized["outcome"] == "held"
+    expression["hold_released_version"] = None
+    state["final_review"] = None
+    refresh(state)
+
+
+def change_expression_goal(state, eid, expected, goal):
+    expression = expression_by_id(state, eid)
+    if expected != expression_version(state, expression):
+        raise RevisionError("stale expression version")
+    require_text(goal, "expression understanding goal")
+    if goal != expression["goal"]:
+        expression["history"].append({"action": "previous_goal", "goal": expression["goal"]})
+        expression["goal"] = goal
+        touch(state, f"expression goal changed: {eid}")
+
+
+def expression_view(state, expression):
+    return {**expression_definition(expression), "version": expression_version(state, expression),
+            "hold_active": expression_has_hold(expression), "review": expression["review"],
+            "review_current": expression_review_current(state, expression)}
+
+
 def make_unit(state, text, kind, parents=()):
     uid = f"u{state['next_id']:04d}"
     state["next_id"] += 1
@@ -332,10 +488,14 @@ def context(state, unit):
             headings = [h for h in headings if h["level"] < level]
             headings.append({"level": level, "text": block["text"]})
     refs = [{"id": uid, "text": unit_by_id(state, uid)["text"]} for uid in unit["context_ids"]]
-    return {"brief": state["brief"], "headings": headings,
+    result = {"brief": state["brief"], "headings": headings,
             "before": units[index - 1]["text"] if index else "",
             "after": units[index + 1]["text"] if index + 1 < len(units) else "",
             "related": refs, "notes": unit["notes"]}
+    expressions = expressions_for(state, unit)
+    if expressions:
+        result["expressions"] = [expression_definition(e) for e in expressions]
+    return result
 
 
 def token(state, unit):
@@ -347,7 +507,9 @@ def refresh(state):
     for unit in state["units"]:
         review = unit.get("review")
         if unit["state"] in TERMINAL and (not isinstance(review, dict) or
-                                         review.get("token") != token(state, unit)):
+                review.get("token") != token(state, unit)
+                or review.get("expression_reviews", {}) != expression_fingerprints(state, unit)
+                or any(not expression_review_current(state, e) for e in expressions_for(state, unit))):
             unit["state"] = "recheck"
             unit["awaiting_review"] = False
 
@@ -368,6 +530,25 @@ def validate_state(state):
             raise RevisionError("invalid unit state")
         if any(uid not in ids or uid == unit["id"] for uid in unit["context_ids"]):
             raise RevisionError("invalid context reference")
+    expressions = state.get("expressions", {})
+    if not isinstance(expressions, dict):
+        raise RevisionError("expressions must be a registry object")
+    all_ids = set(ids) | {u["id"] for u in state["retired"]}
+    for eid, expression in expressions.items():
+        if not isinstance(expression, dict):
+            raise RevisionError("expression must be an object")
+        if expression["id"] != eid or not isinstance(eid, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", eid):
+            raise RevisionError("invalid expression identifier")
+        require_text(expression["goal"], "expression understanding goal")
+        source = expression["source"]
+        if not isinstance(source, dict) or not isinstance(expression["source_text"], str):
+            raise RevisionError("expression source requires a text snapshot and location")
+        if source["unit_id"] not in all_ids:
+            raise RevisionError("expression source lost from active/retired history")
+        quote_position(expression["source_text"], source["quote"], source["start"])
+        owners = expression["owners"]
+        if not isinstance(owners, list) or not owners or len(set(owners)) != len(owners) or set(owners) - set(ids):
+            raise RevisionError("expression must retain active owners")
     refresh(state)
 
 
@@ -428,10 +609,11 @@ def view(state, unit):
     return {"target": {"id": unit["id"], "kind": unit["kind"], "token": token(state, unit),
                        "text": unit["text"], "initial_working_text": unit["initial_text"],
                        "original_text": original_text, "original_scope": original_scope,
-                       "state": unit["state"], "hold_active": has_active_hold(unit),
+                       "state": unit["state"], "hold_active": unit_has_hold(state, unit),
                        "attempts": unit["attempts"],
                        "max_iterations": state["max_iterations"], "plan": unit["plan"],
                        "required_criteria": criteria_for(state, "unit", unit["plan"])},
+            "required_expressions": [expression_view(state, e) for e in expressions_for(state, unit)],
             "reference_only": context(state, unit), "previous_review": unit["review"]}
 
 
@@ -458,9 +640,10 @@ def status(state):
             "max_iterations": state["max_iterations"],
             "document_plan": state["document_plan"],
             "document_criteria": criteria_for(state, "document", state["document_plan"]),
+            "expressions": [expression_view(state, e) for e in state.get("expressions", {}).values()],
             "counts": dict(Counter(u["state"] for u in state["units"])),
             "units": [{"id": u["id"], "kind": u["kind"], "state": u["state"],
-                       "hold_active": has_active_hold(u),
+                       "hold_active": unit_has_hold(state, u),
                        "token": token(state, u), "attempts": u["attempts"]} for u in state["units"]],
             "final_review_current": bool(state["final_review"] and
                                          state["final_review"]["token"] == document_token(state))}
@@ -468,7 +651,7 @@ def status(state):
 
 def next_target(state):
     refresh(state)
-    unit = next((u for u in state["units"] if u["state"] not in TERMINAL and not has_active_hold(u)), None)
+    unit = next((u for u in state["units"] if u["state"] not in TERMINAL and not unit_has_hold(state, u)), None)
     return view(state, unit) if unit else {"target": None, **status(state)}
 
 
@@ -517,6 +700,7 @@ def annotate(state, uid, expected, data):
 def invalidate(state, ids, reason, *, reopen_holds=True):
     require_text(reason, "invalidation reason")
     targets = [unit_by_id(state, uid) for uid in ids]
+    target_ids = {unit["id"] for unit in targets}
     for unit in targets:
         unit["generation"] += 1
         unit["state"] = "recheck"
@@ -524,6 +708,12 @@ def invalidate(state, ids, reason, *, reopen_holds=True):
             unit["hold_active"] = False
             review = unit.get("review")
             unit["hold_released_token"] = review.get("token") if isinstance(review, dict) else None
+    if reopen_holds:
+        for expression in state.get("expressions", {}).values():
+            if set(expression["owners"]) & target_ids:
+                expression["hold_active"] = False
+                review = expression["review"]
+                expression["hold_released_version"] = review["version"] if review else None
     touch(state, reason)
 
 
@@ -533,7 +723,7 @@ def edit(state, uid, expected, text, affected=(), all_affected=False):
     if text == unit["text"]:
         return
     validate_plan(unit["plan"], criteria_for(state, "unit"))
-    if has_active_hold(unit):
+    if unit_has_hold(state, unit):
         raise RevisionError("held unit: invalidate with the new information/decision before editing")
     if unit["attempts"] >= state["max_iterations"]:
         raise RevisionError("iteration limit reached: record a held result with remaining issue and proposal")
@@ -589,14 +779,14 @@ def validate_checks(checks, criteria):
         raise RevisionError("missing results for registered criteria: " + ", ".join(sorted(expected.keys() - seen)))
 
 
-def validate_record(record, criteria):
+def validate_record(record, criteria, expression_outcomes=()):
     if not isinstance(record, dict) or set(record) != {"outcome", "checks"}:
         raise RevisionError("result input requires only outcome and checks; criteria belong in the plan")
     outcome = record["outcome"]
     if not isinstance(outcome, str) or outcome not in {"confirmed", "unchanged", "needs_revision", "held"}:
         raise RevisionError("invalid outcome")
     validate_checks(record["checks"], criteria)
-    statuses = {check["status"] for check in record["checks"]}
+    statuses = {check["status"] for check in record["checks"]} | set(expression_outcomes)
     if outcome in {"confirmed", "unchanged"} and statuses & {"needs_revision", "held"}:
         raise RevisionError("unresolved criteria cannot be confirmed or unchanged")
     if outcome == "needs_revision" and "needs_revision" not in statuses:
@@ -612,7 +802,8 @@ def record_review(state, uid, expected, record):
         raise RevisionError("held unit: invalidate with the new information/decision before recording")
     validate_plan(unit["plan"], criteria_for(state, "unit"))
     criteria = criteria_for(state, "unit", unit["plan"])
-    validate_record(record, criteria)
+    expression_outcomes = expression_statuses(state, unit)
+    validate_record(record, criteria, expression_outcomes)
     outcome = record["outcome"]
     if unit["attempts"] >= state["max_iterations"] and outcome != "held":
         raise RevisionError("iteration limit reached: only a documented hold may be recorded")
@@ -628,14 +819,15 @@ def record_review(state, uid, expected, record):
                 held_details(check)
                 check["status"] = "held"
     saved["outcome"] = outcome
-    validate_record(saved, criteria)
+    validate_record(saved, criteria, expression_outcomes)
     review = {"token": expected, "record": saved, "criteria": criteria,
+              "expression_reviews": expression_fingerprints(state, unit),
               "iteration": attempts, "limit_reached": attempts >= state["max_iterations"]}
     unit["attempts"] = attempts
     unit["review"] = review
     unit["history"].append({"action": "review", **copy.deepcopy(review)})
     unit["awaiting_review"] = False
-    unit["hold_active"] = any(check["status"] == "held" for check in saved["checks"])
+    unit["hold_active"] = "held" in expression_outcomes or any(check["status"] == "held" for check in saved["checks"])
     unit["hold_released_token"] = None
     unit["state"] = "recheck" if outcome == "needs_revision" else outcome
     state["final_review"] = None
@@ -685,9 +877,9 @@ def safe_cuts(text, cuts, kind):
 
 
 
-def check_regroupable(units):
+def check_regroupable(state, units):
     for unit in units:
-        if has_active_hold(unit):
+        if unit_has_hold(state, unit):
             raise RevisionError("held unit: invalidate with the new information/decision before regrouping")
         if unit["awaiting_review"]:
             raise RevisionError("record the check of the last edit before regrouping")
@@ -703,6 +895,10 @@ def replace_units(state, old, new, reason):
         raise RevisionError("regrouping must preserve text exactly")
     state["retired"].extend(copy.deepcopy(old))
     state["units"][positions[0]:positions[-1] + 1] = new
+    for expression in state.get("expressions", {}).values():
+        expression["owners"] = list(dict.fromkeys(
+            uid for owner in expression["owners"]
+            for uid in ([u["id"] for u in new] if owner in ids else [owner])))
     for unit in state["units"]:
         refs = []
         for ref in unit["context_ids"]:
@@ -716,7 +912,7 @@ def replace_units(state, old, new, reason):
 def split_unit(state, uid, expected, parts):
     unit = unit_by_id(state, uid)
     check_token(state, unit, expected)
-    check_regroupable([unit])
+    check_regroupable(state, [unit])
     if (not isinstance(parts, list) or len(parts) < 2 or
             any(not isinstance(p, str) or not p for p in parts) or "".join(parts) != unit["text"]):
         raise RevisionError("split parts must be nonempty and concatenate exactly to the current target")
@@ -761,7 +957,7 @@ def merge_units(state, ids):
     positions = [state["units"].index(u) for u in old]
     if positions != list(range(positions[0], positions[0] + len(old))):
         raise RevisionError("merge requires contiguous units in document order")
-    check_regroupable(old)
+    check_regroupable(state, old)
     text = "".join(u["text"] for u in old)
     new = make_unit(state, text, "group", ids)
     new["notes"]["inherited"] = [copy.deepcopy(u["notes"]) for u in old]
@@ -812,9 +1008,11 @@ def blocking_issues(state):
         try:
             validate_plan(unit["plan"], criteria_for(state, "unit"))
             criteria = criteria_for(state, "unit", unit["plan"])
-            validate_record(review["record"], criteria)
+            validate_record(review["record"], criteria, expression_statuses(state, unit))
             if review["criteria"] != criteria or review["record"]["outcome"] != unit["state"]:
                 raise RevisionError("record does not match current criteria/state")
+            if review.get("expression_reviews", {}) != expression_fingerprints(state, unit):
+                raise RevisionError("expression results changed after the unit check")
         except RevisionError as error:
             issues.append(f"{uid}: {error}")
     return issues
@@ -859,8 +1057,15 @@ def finish(state):
             if u["state"] == "held"]
     if any(check["status"] == "held" for check in full["record"]["checks"]):
         held.append({"id": "document", "plan": state["document_plan"], **full})
+    expressions = [expression_view(state, e) for e in state.get("expressions", {}).values()]
+    for expression in expressions:
+        if not expression["review_current"]:
+            raise RevisionError(f"{expression['id']}: current-version expression result is required")
+        if expression["review"]["record"]["outcome"] == "held":
+            held.append({"kind": "expression", **expression})
     return {"text": render(state), "document_token": document_token(state),
-            "brief": state["brief"], "fully_resolved": not held, "held": held, "final_review": full}
+            "brief": state["brief"], "fully_resolved": not held, "held": held, "final_review": full,
+            "expressions": expressions}
 
 
 def parser():
@@ -896,6 +1101,18 @@ def parser():
     plan_target.add_argument("--document", action="store_true")
     plan.add_argument("--token", required=True)
     plan.add_argument("--file", required=True, type=Path)
+    expressions = sub.add_parser("expressions")
+    expressions.add_argument("--unit", required=True)
+    expressions.add_argument("--token", required=True)
+    expressions.add_argument("--file", required=True, type=Path)
+    expression_check = sub.add_parser("expression-check")
+    expression_check.add_argument("--id", required=True)
+    expression_check.add_argument("--version", required=True)
+    expression_check.add_argument("--file", required=True, type=Path)
+    expression_goal = sub.add_parser("expression-goal")
+    expression_goal.add_argument("--id", required=True)
+    expression_goal.add_argument("--version", required=True)
+    expression_goal.add_argument("--goal", required=True)
     for name in ("edit", "record", "annotate", "split"):
         item = sub.add_parser(name)
         item.add_argument("--unit", required=True)
@@ -960,6 +1177,15 @@ def main(argv=None):
             elif command == "record":
                 record_review(state, args.unit, args.token, read_json(args.file))
                 result = status(state)
+            elif command == "expressions":
+                register_expressions(state, args.unit, args.token, read_json(args.file))
+                result = view(state, unit_by_id(state, args.unit))
+            elif command == "expression-check":
+                record_expression(state, args.id, args.version, read_json(args.file))
+                result = expression_view(state, expression_by_id(state, args.id))
+            elif command == "expression-goal":
+                change_expression_goal(state, args.id, args.version, args.goal)
+                result = expression_view(state, expression_by_id(state, args.id))
             elif command == "annotate":
                 annotate(state, args.unit, args.token, read_json(args.file))
                 result = view(state, unit_by_id(state, args.unit))

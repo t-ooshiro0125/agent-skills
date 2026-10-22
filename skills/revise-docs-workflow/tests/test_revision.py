@@ -1070,6 +1070,247 @@ class CriterionWorkflowTests(unittest.TestCase):
             self.assertEqual(value, before)
 
 
+class ExpressionTrackingTests(unittest.TestCase):
+    def register(self, value, unit=None, entries=None):
+        unit = unit or value["units"][0]
+        entries = entries or [{"id": "term_a", "quote": "用語A", "origin": "inspection",
+                               "goal": "用語Aの意味と、この判断で使う役割が分かる"}]
+        revision.register_expressions(value, unit["id"], revision.token(value, unit), entries)
+        return revision.expression_by_id(value, entries[0]["id"])
+
+    def explanation(self, value, unit=None, **fields):
+        unit = unit or value["units"][0]
+        return {"outcome": "explained", "observation": "引用した本文で対象と判断に必要な意味を確認した",
+                "evidence": [{"unit_id": unit["id"], "token": revision.token(value, unit),
+                              "quote": unit["text"].strip()}], **fields}
+
+    def check(self, value, expression, result=None):
+        revision.record_expression(value, expression["id"], revision.expression_version(value, expression),
+                                   result or self.explanation(value))
+
+    def test_two_expressions_require_both_results_before_unit_or_document_completion(self):
+        value = state("用語Aと用語Bを判断に使う。\n")
+        unit = value["units"][0]
+        a = self.register(value, entries=[
+            {"id": "term_a", "quote": "用語A", "origin": "user", "goal": "Aの意味が分かる"},
+            {"id": "term_b", "quote": "用語B", "origin": "inspection", "goal": "Bの意味が分かる"}])
+        self.check(value, a)
+        with self.assertRaisesRegex(revision.RevisionError, "term_b"):
+            revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit))
+        with self.assertRaises(revision.RevisionError):
+            final(value)
+        self.check(value, value["expressions"]["term_b"])
+        accept_all(value)
+        final(value)
+        self.assertTrue(revision.finish(value)["fully_resolved"])
+
+    def test_registration_is_atomic_and_rejects_duplicate_ids_or_result_fields(self):
+        value = state("用語A。\n")
+        unit = value["units"][0]
+        valid = {"id": "term_a", "quote": "用語A", "origin": "user", "goal": "Aの意味が分かる"}
+        for invalid in ({**valid, "id": "absent", "quote": "ない用語"},
+                        {**valid, "outcome": "explained"}, valid):
+            before = copy.deepcopy(value)
+            with self.assertRaises(revision.RevisionError):
+                self.register(value, entries=[valid, invalid])
+            self.assertEqual(value, before)
+        self.register(value, entries=[valid])
+        with self.assertRaises(revision.RevisionError):
+            self.register(value, entries=[valid])
+        self.assertEqual(value["expressions"]["term_a"]["review"], None)
+        with self.assertRaises(revision.RevisionError):
+            revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit))
+
+    def test_repeated_quote_requires_an_exact_character_position(self):
+        value = state("用語Aと用語A。\n")
+        with self.assertRaisesRegex(revision.RevisionError, "uniquely"):
+            self.register(value)
+        expression = self.register(value, entries=[
+            {"id": "term_a", "quote": "用語A", "start": 4, "origin": "inspection", "goal": "意味が分かる"}])
+        self.assertEqual(expression["source"]["start"], 4)
+        result = self.explanation(value)
+        result["evidence"][0].update(quote="用語A", start=3)
+        with self.assertRaisesRegex(revision.RevisionError, "position"):
+            self.check(value, expression, result)
+
+    def test_evidence_can_reference_another_paragraph_without_deleting_the_source_word(self):
+        value = state("用語Aを使う。\n\n用語Aは利用できる件数の上限を示す。\n")
+        expression = self.register(value)
+        self.check(value, expression, self.explanation(value, value["units"][1], outcome="unchanged",
+                                                     reason="後段に何の上限かを説明している"))
+        accept_all(value)
+        final(value)
+        result = revision.finish(value)
+        self.assertEqual(result["text"], value["original"])
+        self.assertTrue(result["fully_resolved"])
+        self.assertEqual(expression["source"]["quote"], "用語A")
+
+    def test_absent_explanation_is_rejected_even_with_a_fresh_unit_token(self):
+        value = state("用語A。\n")
+        expression = self.register(value)
+        result = self.explanation(value)
+        result["evidence"][0]["quote"] = "本文には存在しない説明"
+        with self.assertRaisesRegex(revision.RevisionError, "quote"):
+            self.check(value, expression, result)
+        self.assertIsNone(expression["review"])
+
+    def test_changed_explanation_invalidates_a_different_owner_and_old_evidence_cannot_be_relabelled(self):
+        value = state("用語A。\n\nAは上限を指す。\n", limit=5)
+        owner, explanation = value["units"]
+        expression = self.register(value)
+        result = self.explanation(value, explanation)
+        self.check(value, expression, result)
+        accept_all(value)
+        final(value)
+        revision.edit(value, explanation["id"], revision.token(value, explanation), "別の説明。\n")
+        self.assertFalse(revision.expression_review_current(value, expression))
+        self.assertEqual(owner["state"], "recheck")
+        with self.assertRaises(revision.RevisionError):
+            self.check(value, expression, result)
+        result["evidence"][0]["token"] = revision.token(value, explanation)
+        with self.assertRaisesRegex(revision.RevisionError, "quote"):
+            self.check(value, expression, result)
+        with self.assertRaises(revision.RevisionError):
+            revision.finish(value)
+
+    def test_body_reader_context_and_goal_changes_require_new_expression_results(self):
+        for change in ("body", "reader", "goal", "neighbor"):
+            with self.subTest(change=change):
+                value = state("用語A。\n\n後段。\n")
+                owner = value["units"][0]
+                expression = self.register(value)
+                version = revision.expression_version(value, expression)
+                result = self.explanation(value)
+                self.check(value, expression, result)
+                accept_all(value)
+                if change == "body":
+                    revision.edit(value, owner["id"], revision.token(value, owner), "用語Aの説明。\n")
+                elif change == "reader":
+                    brief = copy.deepcopy(value["brief"])
+                    brief["reader_difficulties"] = "用語を既知としない"
+                    revision.update_brief(value, brief)
+                elif change == "goal":
+                    revision.change_expression_goal(value, expression["id"], version, "Aを何の判断に使えるか分かる")
+                else:
+                    neighbor = value["units"][1]
+                    revision.edit(value, neighbor["id"], revision.token(value, neighbor), "後段の条件。\n")
+                self.assertFalse(revision.expression_review_current(value, expression))
+                with self.assertRaisesRegex(revision.RevisionError, "stale expression version"):
+                    revision.record_expression(value, expression["id"], version, result)
+
+    def test_changing_only_the_expression_result_invalidates_the_unit_result(self):
+        value = state("用語A。\n", limit=5)
+        unit = value["units"][0]
+        expression = self.register(value)
+        self.check(value, expression)
+        accept_all(value)
+        final(value)
+        old_token = revision.token(value, unit)
+        self.check(value, expression, self.explanation(value, outcome="needs_revision",
+                                                     observation="Aを何に使うかは本文から分からない"))
+        self.assertEqual(revision.token(value, unit), old_token)
+        self.assertEqual(unit["state"], "recheck")
+        with self.assertRaises(revision.RevisionError):
+            revision.finish(value)
+        with self.assertRaises(revision.RevisionError):
+            revision.record_review(value, unit["id"], old_token, result_for(value, unit))
+        self.assertIsNone(value["final_review"])
+
+    def test_unchanged_requires_a_reason_and_held_requires_actionable_details(self):
+        value = state("用語A。\n")
+        expression = self.register(value)
+        for outcome in ("unchanged", "held"):
+            with self.subTest(outcome=outcome), self.assertRaises(revision.RevisionError):
+                self.check(value, expression, self.explanation(value, outcome=outcome))
+        self.assertIsNone(expression["review"])
+
+    def test_iteration_limit_requires_a_documented_hold_for_each_unresolved_expression(self):
+        value = state("用語A。\n", limit=1)
+        unit = value["units"][0]
+        expression = self.register(value)
+        self.check(value, expression, self.explanation(value, outcome="needs_revision"))
+        result = result_for(value, unit)
+        result["outcome"] = "needs_revision"
+        before = copy.deepcopy(value)
+        with self.assertRaises(revision.RevisionError):
+            revision.record_review(value, unit["id"], revision.token(value, unit), result)
+        self.assertEqual(value, before)
+        self.check(value, expression, self.explanation(value, outcome="held", reason="Aの意味を確定できない",
+            proposal="意味の根拠を確認して説明を補う", required_decision="根拠資料と説明追加の可否を確認する"))
+        result["outcome"] = "held"
+        revision.record_review(value, unit["id"], revision.token(value, unit), result)
+        self.assertEqual(unit["attempts"], 1)
+        self.assertTrue(unit["review"]["limit_reached"])
+        final(value)
+        self.assertFalse(revision.finish(value)["fully_resolved"])
+
+    def test_held_expression_blocks_mutation_but_can_be_reported_and_explicitly_reopened(self):
+        value = state("用語A。\n\n独立した説明。\n", limit=5)
+        unit = value["units"][0]
+        expression = self.register(value)
+        self.check(value, expression, self.explanation(value, outcome="held", reason="Aの定義の根拠が不足",
+                 proposal="定義を確認して判断に必要な意味を添える", required_decision="定義の一次資料を確認する"))
+        self.assertTrue(revision.view(value, unit)["target"]["hold_active"])
+        self.assertEqual(revision.next_target(value)["target"]["id"], value["units"][1]["id"])
+        for operation in (
+                lambda: self.check(value, expression),
+                lambda: revision.edit(value, unit["id"], revision.token(value, unit), "用語Aの説明。\n"),
+                lambda: revision.merge_units(value, [u["id"] for u in value["units"]])):
+            with self.assertRaises(revision.RevisionError):
+                operation()
+        result = result_for(value, unit)
+        result["outcome"] = "held"
+        revision.record_review(value, unit["id"], revision.token(value, unit), result)
+        other = value["units"][1]
+        revision.record_review(value, other["id"], revision.token(value, other), result_for(value, other))
+        final(value)
+        report = revision.finish(value)
+        self.assertFalse(report["fully_resolved"])
+        self.assertTrue(any(h.get("kind") == "expression" for h in report["held"]))
+        brief = copy.deepcopy(value["brief"])
+        brief["reader"] = "別の担当者"
+        revision.update_brief(value, brief)
+        self.assertTrue(revision.expression_has_hold(expression))
+        revision.invalidate(value, iter([unit["id"]]), "不足する定義の根拠を得た")
+        self.assertFalse(revision.unit_has_hold(value, unit))
+        self.check(value, expression)
+        accept_all(value)
+        final(value)
+        self.assertTrue(revision.finish(value)["fully_resolved"])
+        self.assertEqual(len(expression["history"]), 2)
+
+    def test_split_merge_and_reorder_preserve_ids_sources_history_and_require_current_checks(self):
+        value = state("用語A。\n\n用語B。\n\n後段。\n", limit=8)
+        first, second, last = value["units"]
+        a = self.register(value)
+        b = self.register(value, second, [{"id": "term_b", "quote": "用語B", "origin": "user", "goal": "Bの意味が分かる"}])
+        self.check(value, a)
+        self.check(value, b, self.explanation(value, second))
+        accept_all(value)
+        original_source = copy.deepcopy(a["source"])
+        merged_id = revision.merge_units(value, [first["id"], second["id"]])
+        merged = revision.unit_by_id(value, merged_id)
+        self.assertEqual(a["owners"], [merged_id])
+        ids = revision.split_unit(value, merged_id, revision.token(value, merged), [first["text"], second["text"]])
+        self.assertEqual(a["owners"], ids)
+        self.assertEqual(b["owners"], ids)
+        revision.reorder(value, [last["id"], *ids])
+        revision.validate_state(value)
+        self.assertEqual(set(value["expressions"]), {"term_a", "term_b"})
+        self.assertEqual(a["source"], original_source)
+        self.assertEqual(len(a["history"]), 1)
+        self.assertFalse(revision.expression_review_current(value, a))
+        for unit in value["units"]:
+            if unit["id"] in ids:
+                with self.assertRaisesRegex(revision.RevisionError, "term_a"):
+                    revision.record_review(value, unit["id"], revision.token(value, unit), result_for(value, unit))
+        self.check(value, a, self.explanation(value, revision.unit_by_id(value, ids[0])))
+        self.check(value, b, self.explanation(value, revision.unit_by_id(value, ids[1])))
+        accept_all(value)
+        final(value)
+        self.assertTrue(revision.finish(value)["fully_resolved"])
+
+
 class CliTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -1086,6 +1327,38 @@ class CliTests(unittest.TestCase):
                                  *map(str, args)], capture_output=True, text=True, umask=umask)
         self.assertEqual(result.returncode, 0 if success else 1, result.stderr)
         return result
+
+    def test_cli_expression_coverage_and_evidence_errors_preserve_state(self):
+        value = state("用語Aと用語B。\n")
+        unit = value["units"][0]
+        revision.save(self.path, value)
+        registrations = self.root / "expressions.json"
+        registrations.write_text(json.dumps([
+            {"id": "a", "quote": "用語A", "origin": "user", "goal": "Aの意味が分かる"},
+            {"id": "b", "quote": "用語B", "origin": "inspection", "goal": "Bの意味が分かる"}]))
+        shown = json.loads(self.cli("expressions", "--unit", unit["id"], "--token",
+                                    revision.token(value, unit), "--file", registrations).stdout)
+        expression_result = self.root / "expression-result.json"
+        expression_result.write_text(json.dumps({"outcome": "explained", "observation": "Aの意味を本文で確認した",
+            "evidence": [{"unit_id": unit["id"], "token": shown["target"]["token"], "quote": "存在しない引用"}]}))
+        before = self.path.read_bytes()
+        self.cli("expression-check", "--id", "a", "--version", shown["required_expressions"][0]["version"],
+                 "--file", expression_result, success=False)
+        self.assertEqual(self.path.read_bytes(), before)
+        result = json.loads(expression_result.read_text())
+        result["evidence"][0]["quote"] = "用語A"
+        expression_result.write_text(json.dumps(result))
+        self.cli("expression-check", "--id", "a", "--version", shown["required_expressions"][0]["version"],
+                 "--file", expression_result)
+        value = revision.load(self.path)
+        unit = value["units"][0]
+        aggregate = self.root / "aggregate.json"
+        aggregate.write_text(json.dumps(result_for(value, unit)))
+        before = self.path.read_bytes()
+        self.cli("record", "--unit", unit["id"], "--token", revision.token(value, unit), "--file", aggregate,
+                 success=False)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(revision.load(self.path)["original"], "用語Aと用語B。\n")
 
     def test_cli_hold_requires_invalidation_before_a_new_result(self):
         value = state("対象。\n")
