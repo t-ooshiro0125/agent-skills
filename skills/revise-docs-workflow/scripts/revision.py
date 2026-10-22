@@ -45,6 +45,10 @@ def markdown_source(text):
     return text.removeprefix("\ufeff")
 
 
+def leading_bom_count(text):
+    return len(text) - len(text.lstrip("\ufeff"))
+
+
 @lru_cache(maxsize=128)
 def syntax(text):
     return tuple(MARKDOWN.parse(markdown_source(text)))
@@ -543,12 +547,25 @@ def layout(state):
         LAYOUTS.move_to_end(key)
         return cached
     cached = {"state": state, "revision": state["revision"], "units": {}, "indices": {},
-              "headings": {}, "expressions": {}}
+              "headings": {}, "expressions": {}, "containers": {}}
+    starts, ends, position = [], [], 0
+    for unit in state["units"]:
+        starts.append(position)
+        position += len(unit["text"])
+        ends.append(position)
     heading_blocks, offset = [], 0
     for block in blocks(render(state)):
+        start = offset
         offset += len(block["text"])
         if block["kind"] == "heading":
             heading_blocks.append((offset, block))
+        members = [unit for unit in state["units"][bisect_right(ends, start):bisect_left(starts, offset)]
+                   if unit["text"]]
+        if len(members) > 1:
+            shared = {"kind": block["kind"], "first_unit": members[0]["id"],
+                      "last_unit": members[-1]["id"], "source_hash": digest(block["text"])}
+            for unit in members:
+                cached["containers"].setdefault(unit["id"], []).append(shared)
     headings, heading_index, position = [], 0, 0
     for index, unit in enumerate(state["units"]):
         while heading_index < len(heading_blocks) and heading_blocks[heading_index][0] <= position:
@@ -595,6 +612,8 @@ def context(state, unit):
     expressions = expressions_for(state, unit)
     if expressions:
         result["expressions"] = [expression_definition(e) for e in expressions]
+    if unit["id"] in current["containers"]:
+        result["markdown_containers"] = copy.deepcopy(current["containers"][unit["id"]])
     return result
 
 
@@ -887,7 +906,7 @@ def edit(state, uid, expected, text, affected=(), all_affected=False):
         raise RevisionError("record the check of the last edit before editing again")
     impacted = [unit_by_id(state, item) for item in affected]
     proposed = [{**u, "text": text} if u is unit else u for u in state["units"]]
-    if state["initial_working"].startswith("\ufeff") != "".join(u["text"] for u in proposed).startswith("\ufeff"):
+    if leading_bom_count(state["initial_working"]) != leading_bom_count("".join(u["text"] for u in proposed)):
         raise RevisionError("keep the leading BOM unchanged when editing")
     if split_structure_shapes(state["units"]) != split_structure_shapes(proposed):
         raise RevisionError("preserve split table/list structure; merge the whole structure before changing it")
@@ -1264,7 +1283,7 @@ def reorder(state, ids):
             structure = "table headers and rows" if kind == "table_open" else "list items"
             raise RevisionError(f"keep split {structure} together in order; merge the structure before reordering its parts")
     ordered = [unit_by_id(state, uid) for uid in ids]
-    if state["initial_working"].startswith("\ufeff") != "".join(u["text"] for u in ordered).startswith("\ufeff"):
+    if leading_bom_count(state["initial_working"]) != leading_bom_count("".join(u["text"] for u in ordered)):
         raise RevisionError("keep the leading BOM at the start of the document when reordering")
     if Counter(spans) != Counter(table_and_list_spans(ordered)):
         raise RevisionError("reorder must preserve table and list boundaries")
@@ -1277,7 +1296,7 @@ def reorder(state, ids):
 def blocking_issues(state):
     refresh(state)
     issues = []
-    if render(state).startswith("\ufeff") != state["initial_working"].startswith("\ufeff"):
+    if leading_bom_count(render(state)) != leading_bom_count(state["initial_working"]):
         issues.append("restore the initial leading BOM before finishing")
     for unit in state["units"]:
         uid, review = unit["id"], unit.get("review")
@@ -1321,13 +1340,14 @@ def validate_final_record(state, record):
 
 
 def current_document_hold(state):
-    records = [*reversed(state["document_history"]), state["final_review"]]
-    latest = next((record for record in records if record and "record" in record
-                   and any(check["status"] == "held" for check in record["record"]["checks"])), None)
-    if latest and not any(entry.get("action") == "release_hold" and entry["review_token"] == latest["token"]
+    records = [entry.get("review", entry) for entry in reversed(state["document_history"])]
+    records.append(state["final_review"])
+    latest = next((record for record in records if review_has_hold(record)), None)
+    key = held_review_key(latest) if latest else None
+    if latest and not any(entry.get("action") == "release_hold" and entry["review_token"] == key
                           and isinstance(entry.get("reason"), str) and entry["reason"].strip()
                           for entry in state["document_history"]):
-        return latest
+        return {**latest, "token": key}
     return None
 
 
@@ -1528,7 +1548,7 @@ def main(argv=None):
                 raise RevisionError("unsupported command")
         if args.command != "finish":
             save(args.state, state)
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        print(json.dumps(result, ensure_ascii=True, indent=2))
         return 0
     except (OSError, UnicodeError, ValueError, KeyError, TypeError) as error:
         print(f"revision: {error}", file=sys.stderr)

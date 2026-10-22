@@ -61,6 +61,8 @@ python3 revision.py --state work.json reorder --units u0001 u0005 u0006
 
 `next` は未処理または再確認待ちを一つ返す。`hold_active` のある対象は、文脈変更で状態が `recheck` になった場合も候補から外し、他の対象を進める。`target` の本文・計画・`required_criteria`、`required_expressions` の個別の表現と、`reference_only` の依頼条件・見出し・前後・関連箇所・メモを読む。`previous_review` は過去の結果で、現行版に使えるとは限らない。必要な文脈が不足すれば原文・全文・任意の対象や履歴へ戻る。
 
+`reference_only.markdown_containers` がある場合は、種類と先頭・末尾の対象IDから、対象が属するMarkdownブロックを確認する。構造が対象だけでは分からなければ、示された対象や作業本文を読む。所属するブロックの本文が変わると、確認済みの対象も再確認が必要になる。
+
 ```sh
 python3 revision.py --state work.json show --document original
 python3 revision.py --state work.json show --document initial_working

@@ -115,17 +115,70 @@ def legacy_overwritten_unit_hold(outcome="unchanged"):
     return value, unit
 
 
+def legacy_document_hold():
+    value = state("対象の説明。\n", limit=6)
+    accept_all(value)
+    ensure_plan(value)
+    revision.final_review(value, revision.document_token(value), {
+        "original_comparison": "旧基準で原文と条件を照合した",
+        "standalone_read": "旧基準で全文を確認し判断待ちを残した",
+        "checks": result_for(value, outcome="held")["checks"]})
+    value["format"] = 1
+    return value
+
+
 class SegmentationTests(unittest.TestCase):
+    def test_edit_and_reorder_preserve_the_complete_leading_bom_prefix(self):
+        for count in (1, 2):
+            with self.subTest(count=count):
+                prefix = "\ufeff" * count
+                value = state(prefix + "# Title\n\nBody.\n")
+                unit = value["units"][0]
+                before = copy.deepcopy(value)
+                for changed in (count - 1, count + 1):
+                    text = "\ufeff" * changed + unit["text"].lstrip("\ufeff")
+                    with self.assertRaisesRegex(revision.RevisionError, "leading BOM"):
+                        revision.edit(value, unit["id"], revision.token(value, unit), text)
+                    self.assertEqual(value, before)
+                revision.edit(value, unit["id"], revision.token(value, unit),
+                              prefix + "# Revised\n\n")
+                accept_all(value)
+                final(value)
+                output = revision.finish(value)["text"]
+                self.assertEqual(len(output) - len(output.lstrip("\ufeff")), count)
+        value = state("\ufeffFirst.\n\n\ufeff\ufeffSecond.\n")
+        before = copy.deepcopy(value)
+        with self.assertRaisesRegex(revision.RevisionError, "leading BOM"):
+            revision.reorder(value, [u["id"] for u in reversed(value["units"])])
+        self.assertEqual(value, before)
+
+    def test_shared_paragraph_changes_invalidate_distant_parts(self):
+        parts = ["Start.\n", "Middle.\n", "End `x`.\n"]
+        value = state("".join(parts))
+        whole = value["units"][0]
+        ids = revision.split_unit(value, whole["id"], revision.token(value, whole), parts)
+        accept_all(value)
+        first, _, last = [revision.unit_by_id(value, uid) for uid in ids]
+        old = revision.token(value, last)
+        old_context = revision.context(value, last)["markdown_containers"]
+        revision.edit(value, first["id"], revision.token(value, first), "Start `\n")
+        self.assertEqual(last["state"], "recheck")
+        self.assertNotEqual(revision.token(value, last), old)
+        self.assertNotEqual(revision.context(value, last)["markdown_containers"], old_context)
+        with self.assertRaisesRegex(revision.RevisionError, "stale unit token"):
+            revision.record_review(value, last["id"], old, result_for(value, last))
+
     def test_old_missing_or_added_bom_requires_repair_before_export(self):
-        for prefix in ("\ufeff", ""):
-            with self.subTest(prefix=prefix):
+        for prefix, corrupt in (("\ufeff", ""), ("", "\ufeff"), ("\ufeff", "\ufeff\ufeff"),
+                                ("\ufeff\ufeff", "\ufeff")):
+            with self.subTest(prefix=prefix, corrupt=corrupt):
                 value = state(prefix + "# Title\n\nBody.\n", limit=6)
                 accept_all(value)
                 final(value)
                 full = copy.deepcopy(value["final_review"])
                 unit = value["units"][0]
                 original = unit["text"]
-                unit["text"] = ("" if prefix else "\ufeff") + original.removeprefix("\ufeff")
+                unit["text"] = corrupt + original.lstrip("\ufeff")
                 unit["generation"] += 1
                 unit["inherited_change"] = True
                 unit["history"].append({"action": "edit", "text": original})
@@ -148,6 +201,7 @@ class SegmentationTests(unittest.TestCase):
                 result = revision.finish(value)
                 self.assertTrue(result["fully_resolved"])
                 self.assertEqual(result["text"].startswith("\ufeff"), bool(prefix))
+                self.assertEqual(len(result["text"]) - len(result["text"].lstrip("\ufeff")), len(prefix))
 
     def test_edit_preserves_presence_and_absence_of_leading_bom(self):
         for prefix in ("\ufeff", ""):
@@ -1336,6 +1390,34 @@ class ReviewTests(unittest.TestCase):
 
 
 class CriterionWorkflowTests(unittest.TestCase):
+    def test_upgrade_retains_document_holds_until_explicit_release(self):
+        for flat in (False, True):
+            for token_present in (False, True):
+                with self.subTest(flat=flat, token_present=token_present):
+                    legacy = legacy_document_hold()
+                    if flat:
+                        legacy["final_review"] = {"token": legacy["final_review"]["token"],
+                                                  **legacy["final_review"]["record"]}
+                    if not token_present:
+                        legacy["final_review"].pop("token")
+                    original_hold = copy.deepcopy(legacy["final_review"])
+                    brief = copy.deepcopy(BRIEF)
+                    brief["reader_difficulties"] += "。追加条件も確認する"
+                    value = revision.upgrade(legacy, brief)
+                    accept_all(value)
+                    self.assertTrue(revision.status(value)["document_hold_active"])
+                    with self.assertRaisesRegex(revision.RevisionError, "held document"):
+                        final(value)
+                    self.assertEqual(value["document_history"][0]["review"], original_hold)
+                    key = revision.current_document_hold(value)["token"]
+                    revision.invalidate(value, [u["id"] for u in value["units"]], "旧全文保留の判断を得た")
+                    release = value["document_history"][-1]
+                    self.assertEqual(release, {"action": "release_hold", "review_token": key,
+                                               "reason": "旧全文保留の判断を得た"})
+                    accept_all(value)
+                    final(value)
+                    self.assertTrue(revision.finish(value)["fully_resolved"])
+
     def test_returning_to_old_plan_or_annotation_does_not_restore_old_results(self):
         for change in ("plan", "annotation"):
             with self.subTest(change=change):
@@ -1734,6 +1816,44 @@ class CriterionWorkflowTests(unittest.TestCase):
 
 
 class ExpressionTrackingTests(unittest.TestCase):
+    def test_container_edits_invalidate_distant_unit_and_expression_results(self):
+        for opener, kind in ((TICKS + "\n", "code"), ("<!--\n", "html")):
+            with self.subTest(kind=kind):
+                value = state("Outside.\n\nBefore.\n\nOpening.\n\nNear.\n\n用語A。\n", limit=6)
+                outside, _, opening, _, far = value["units"]
+                expression = self.register(value, unit=far)
+                evidence = self.explanation(value, unit=far)
+                evidence["evidence"][0]["token"] = revision.content_token(value, far)
+                self.check(value, expression, evidence)
+                accept_all(value)
+                old_token = revision.token(value, far)
+                old_version = revision.expression_version(value, expression)
+                outside_token = revision.token(value, outside)
+                original = opening["text"]
+                revision.edit(value, opening["id"], revision.token(value, opening), opener)
+                self.assertEqual(far["state"], "recheck")
+                self.assertNotEqual(revision.token(value, far), old_token)
+                self.assertFalse(revision.expression_review_current(value, expression))
+                self.assertEqual(revision.context(value, far)["markdown_containers"][0]["kind"], kind)
+                self.assertEqual(revision.token(value, outside), outside_token)
+                self.assertEqual(outside["state"], "unchanged")
+                with self.assertRaisesRegex(revision.RevisionError, "stale unit token"):
+                    revision.record_review(value, far["id"], old_token, result_for(value, far))
+                with self.assertRaisesRegex(revision.RevisionError, "stale expression version"):
+                    revision.record_expression(value, expression["id"], old_version, evidence)
+                with self.assertRaises(revision.RevisionError):
+                    revision.record_expression(value, expression["id"],
+                                               revision.expression_version(value, expression), evidence)
+                self.check(value, expression, self.explanation(value, unit=far))
+                accept_all(value)
+                revision.edit(value, opening["id"], revision.token(value, opening), original)
+                self.assertNotEqual(revision.token(value, far), old_token)
+                self.assertNotEqual(revision.expression_version(value, expression), old_version)
+                self.check(value, expression, self.explanation(value, unit=far))
+                accept_all(value)
+                final(value)
+                self.assertEqual(revision.finish(value)["text"], value["original"])
+
     def test_restoring_context_does_not_restore_old_unit_or_expression_results(self):
         cases = [
             ("before", "Before A.\n\n用語A。\n\nFar.\n\nUnaffected.\n", 0, 1),
@@ -2122,6 +2242,57 @@ class ExpressionTrackingTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_json_output_handles_emoji_with_cp932_stdout_before_and_after_export(self):
+        value = state("Original.\n", limit=6)
+        brief = copy.deepcopy(value["brief"])
+        brief["desired_understanding"] += "😀"
+        revision.update_brief(value, brief)
+        revision.save(self.path, value)
+        unit = value["units"][0]
+        edit_file = self.root / "edit.md"
+        edit_file.write_text("修正文 😀。\n")
+        with patch.dict(revision.os.environ, {"PYTHONIOENCODING": "cp932:strict"}):
+            result = self.cli("edit", "--unit", unit["id"], "--token", revision.token(value, unit), "--file", edit_file)
+        self.assertTrue(result.stdout.isascii())
+        self.assertEqual(json.loads(result.stdout)["target"]["text"], edit_file.read_text())
+        value = revision.load(self.path)
+        self.assertEqual(value["units"][0]["text"], edit_file.read_text())
+        accept_all(value)
+        final(value)
+        revision.save(self.path, value)
+        before = self.path.read_bytes()
+        output, report = self.root / "output.md", self.root / "report.json"
+        with patch.dict(revision.os.environ, {"PYTHONIOENCODING": "cp932:strict"}):
+            result = self.cli("finish", "--output", output, "--report", report)
+        self.assertTrue(result.stdout.isascii())
+        self.assertEqual(json.loads(result.stdout)["brief"]["desired_understanding"], brief["desired_understanding"])
+        self.assertEqual(output.read_text(), edit_file.read_text())
+        self.assertEqual(json.loads(report.read_text())["brief"]["desired_understanding"], brief["desired_understanding"])
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_cli_preserves_migrated_document_hold_after_rechecking_new_criteria(self):
+        self.path.write_text(json.dumps(legacy_document_hold()))
+        self.cli("upgrade", "--brief", self.brief)
+        value = revision.load(self.path)
+        accept_all(value)
+        ensure_plan(value)
+        revision.save(self.path, value)
+        before = self.path.read_bytes()
+        result_file = self.root / "final.json"
+        result_file.write_text(json.dumps({"original_comparison": "新基準で原文を照合した",
+                                           "standalone_read": "新基準で全文を読んだ",
+                                           "checks": result_for(value)["checks"]}))
+        self.cli("final-review", "--token", revision.document_token(value), "--file", result_file, success=False)
+        self.cli("finish", "--output", self.root / "output.md", success=False)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertTrue(json.loads(self.cli("status").stdout)["document_hold_active"])
+        self.cli("invalidate", "--all", "--reason", "旧全文保留の判断を確認した")
+        value = revision.load(self.path)
+        accept_all(value)
+        final(value)
+        revision.save(self.path, value)
+        self.cli("finish", "--output", self.root / "output.md")
+
     def test_cli_keeps_bom_and_rejects_unchanged_after_restoring_text(self):
         value = state("\ufeff# Title\n\nBody.\n", limit=6)
         revision.save(self.path, value)
