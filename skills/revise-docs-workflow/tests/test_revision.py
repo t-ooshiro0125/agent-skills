@@ -143,7 +143,7 @@ class SegmentationTests(unittest.TestCase):
             revision.split_unit(value, last["id"], revision.token(value, last), ["| y", " | 2 |\n"])
 
     def test_quoted_fences_cannot_be_split_even_inside_merged_targets(self):
-        for prefix, marker in (("> ", TICKS), ("> > ", "~~~")):
+        for prefix, marker in (("> ", TICKS), ("> > ", "~~~"), (">\t", TICKS)):
             with self.subTest(prefix=prefix):
                 code = prefix + marker + "sh\n" + prefix + "a\n" + prefix + "b\n" + prefix + marker + "\n\n"
                 value = state(code + "後続の段落。\n")
@@ -155,6 +155,37 @@ class SegmentationTests(unittest.TestCase):
                                         [unit["text"][:cut], unit["text"][cut:]])
                 revision.split_unit(value, uid, revision.token(value, unit),
                                     [code, "後続の段落。\n"])
+                self.assertEqual(revision.render(value), value["original"])
+
+    def test_tab_indented_fences_allow_item_boundaries_and_reject_code_splits(self):
+        first = "- item\n\t" + TICKS + "sh\n\techo hi\n\t" + TICKS + "\n"
+        value = state(first + "- next\n")
+        unit = value["units"][0]
+        with self.assertRaises(revision.RevisionError):
+            revision.split_unit(value, unit["id"], revision.token(value, unit),
+                                ["- item\n\t" + TICKS + "sh\n",
+                                 "\techo hi\n\t" + TICKS + "\n- next\n"])
+        revision.split_unit(value, unit["id"], revision.token(value, unit), [first, "- next\n"])
+        self.assertEqual(revision.render(value), value["original"])
+
+    def test_lists_split_only_between_whole_items_including_in_merged_targets(self):
+        first = "1. first\n   continued\n   - nested\n\n"
+        second = "2. second\n"
+        for merged in (False, True):
+            with self.subTest(merged=merged):
+                value = state(("前の段落。\n\n" if merged else "") + first + second)
+                uid = (revision.merge_units(value, [u["id"] for u in value["units"]])
+                       if merged else value["units"][0]["id"])
+                unit = revision.unit_by_id(value, uid)
+                text = unit["text"]
+                for cut in (text.index("continued"), text.index("   - nested"),
+                            text.index("second") + 3):
+                    with self.assertRaises(revision.RevisionError):
+                        revision.split_unit(value, uid, revision.token(value, unit),
+                                            [text[:cut], text[cut:]])
+                cut = text.index("2. second")
+                revision.split_unit(value, uid, revision.token(value, unit),
+                                    [text[:cut], text[cut:]])
                 self.assertEqual(revision.render(value), value["original"])
 
     def test_reorder_requires_complete_permutation_and_invalidates_all(self):

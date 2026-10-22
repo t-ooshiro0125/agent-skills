@@ -478,11 +478,23 @@ def safe_cuts(text, cuts, kind):
         if block["kind"] == "table" and kind not in {"table", "table_rows"}:
             if any(offset < c < end for c in cuts):
                 raise RevisionError("separate the whole table before splitting its rows")
+        if block["kind"] == "list":
+            list_lines = block["text"].splitlines(keepends=True)
+            indent = len(LIST.match(list_lines[0]).group(1))
+            boundaries, position = set(), offset
+            for line in list_lines:
+                item = LIST.match(line)
+                if item and len(item.group(1)) == indent:
+                    boundaries.add(position)
+                position += len(line)
+            if any(offset < cut < end and cut not in boundaries for cut in cuts):
+                raise RevisionError("split lists only between complete top-level items")
         offset = end
     offset = 0
     lines = text.splitlines(keepends=True)
     unquoted = []
     for line in lines:
+        line = line.expandtabs(4)
         # A fence may be nested in one or more blockquotes.
         prefix = re.match(r"^ {0,3}>[ \t]?", line)
         while prefix:
@@ -491,9 +503,9 @@ def safe_cuts(text, cuts, kind):
         unquoted.append(line)
     i = 0
     while i < len(lines):
-        if FENCE.match(unquoted[i].lstrip()):
+        if FENCE.match(unquoted[i].lstrip(" ")):
             # Lists can contain indented fences which must also stay whole.
-            indent = len(unquoted[i]) - len(unquoted[i].lstrip())
+            indent = len(unquoted[i]) - len(unquoted[i].lstrip(" "))
             normalized = [line[indent:] if line.startswith(" " * indent) else line
                           for line in unquoted]
             end = fence_end(normalized, i)
