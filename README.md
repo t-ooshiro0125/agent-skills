@@ -13,6 +13,7 @@ Codex では `$<skill-name>`、Claude Code では `/<skill-name>` を依頼に�
 | [review-docs](skills/review-docs/SKILL.md) | 文書の正しさ・不足・不要な記述と、情報の配置・移動・分割を検討 | [ガイド](docs/usage/review-docs.md) |
 | [challenge-docs](skills/challenge-docs/SKILL.md) | 文書レビューの指摘や追加・削除案への反証 | [ガイド](docs/usage/challenge-docs.md) |
 | [review-docs-workflow](skills/review-docs-workflow/SKILL.md) | 文書の内容検討・反証・構成と表現の確認を順に実行 | [ガイド](docs/usage/review-docs-workflow.md) |
+| [revise-docs-workflow](skills/revise-docs-workflow/SKILL.md) | 文書の内容確認・指摘の検証・リライト・修正後の確認を一続きに実行 | [ガイド](docs/usage/revise-docs-workflow.md) |
 | [review](skills/review/SKILL.md) | 差分の挙動・バグ・テストの穴をレビュー | [ガイド](docs/usage/review.md) |
 | [review-tests](skills/review-tests/SKILL.md) | 言語共通のテストの回帰検知力・独立性・保守性をレビュー | [ガイド](docs/usage/review-tests.md) |
 | [review-tests-rspec](skills/review-tests-rspec/SKILL.md) | 共通基準に RSpec 固有の観点を加えてテストをレビュー | [ガイド](docs/usage/review-tests-rspec.md) |
