@@ -1,6 +1,7 @@
 import copy
 import importlib.util
 import json
+import os
 from pathlib import Path
 import stat
 import subprocess
@@ -2562,6 +2563,61 @@ class CliTests(unittest.TestCase):
         self.assertEqual(json.loads(report.read_text())["brief"]["desired_understanding"], brief["desired_understanding"])
         self.assertEqual(self.path.read_bytes(), before)
 
+    def test_committed_edit_succeeds_when_stdout_pipe_has_no_reader(self):
+        for padding in ("", "x" * 100000):
+            with self.subTest(large=bool(padding)):
+                value = state("Original.\n", limit=6)
+                revision.save(self.path, value)
+                unit = value["units"][0]
+                old_token = revision.token(value, unit)
+                edit_file = self.root / "edit.md"
+                edit_file.write_text("Revised. " + padding + "\n")
+                result = self.cli_with_closed_stdout(
+                    "edit", "--unit", unit["id"], "--token", old_token, "--file", edit_file)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+                current = revision.load(self.path)
+                self.assertEqual(current["units"][0]["text"], edit_file.read_text())
+                self.assertNotEqual(revision.token(current, current["units"][0]), old_token)
+
+    def test_committed_finish_succeeds_when_stdout_pipe_has_no_reader(self):
+        for padding in ("", "x" * 100000):
+            with self.subTest(large=bool(padding)):
+                value = state("Finished document.\n", limit=6)
+                brief = copy.deepcopy(value["brief"])
+                brief["desired_understanding"] += padding
+                revision.update_brief(value, brief)
+                accept_all(value)
+                final(value)
+                revision.save(self.path, value)
+                before = self.path.read_bytes()
+                output, report = self.root / "output.md", self.root / "report.json"
+                result = self.cli_with_closed_stdout("finish", "--output", output, "--report", report)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(output.read_text(), revision.render(value))
+                self.assertTrue(json.loads(report.read_text())["fully_resolved"])
+                self.assertEqual(self.path.read_bytes(), before)
+
+    def test_closed_stdout_does_not_turn_rejected_operations_into_success(self):
+        value = state("Original.\n")
+        revision.save(self.path, value)
+        before = self.path.read_bytes()
+        edit_file = self.root / "edit.md"
+        edit_file.write_text("Revised.\n")
+        unit = value["units"][0]
+        result = self.cli_with_closed_stdout(
+            "edit", "--unit", unit["id"], "--token", "stale-token", "--file", edit_file)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("stale", result.stderr)
+        self.assertEqual(self.path.read_bytes(), before)
+        output = self.root / "output.md"
+        result = self.cli_with_closed_stdout("finish", "--output", output)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("unfinished", result.stderr)
+        self.assertFalse(output.exists())
+        self.assertEqual(self.path.read_bytes(), before)
+
     def test_cli_preserves_migrated_document_hold_after_rechecking_new_criteria(self):
         self.path.write_text(json.dumps(legacy_document_hold()))
         self.cli("upgrade", "--brief", self.brief)
@@ -2715,6 +2771,13 @@ class CliTests(unittest.TestCase):
                                  *map(str, args)], capture_output=True, text=True, umask=umask)
         self.assertEqual(result.returncode, 0 if success else 1, result.stderr)
         return result
+
+    def cli_with_closed_stdout(self, *args):
+        read_fd, write_fd = os.pipe()
+        os.close(read_fd)
+        with os.fdopen(write_fd, "wb") as stdout:
+            return subprocess.run([sys.executable, str(SCRIPT), "--state", str(self.path),
+                                   *map(str, args)], stdout=stdout, stderr=subprocess.PIPE, text=True)
 
     def test_cli_document_hold_survives_limit_extension_and_reload_until_explicit_invalidation(self):
         value = state("対象。\n", limit=5)

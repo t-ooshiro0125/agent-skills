@@ -1612,7 +1612,12 @@ def main(argv=None):
                 raise RevisionError("unsupported command")
         if args.command != "finish":
             save(args.state, state)
-        print(json.dumps(result, ensure_ascii=True, indent=2))
+        try:
+            print(json.dumps(result, ensure_ascii=True, indent=2), flush=True)
+        except BrokenPipeError:
+            # Persistence succeeded; keep shutdown's stdout flush from changing the exit status.
+            with open(os.devnull, "w") as devnull:
+                os.dup2(devnull.fileno(), sys.stdout.fileno())
         return 0
     except (OSError, UnicodeError, ValueError, KeyError, TypeError) as error:
         print(f"revision: {error}", file=sys.stderr)
