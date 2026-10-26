@@ -11,6 +11,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from git_test_environment import isolate_git_environment
+
 
 INSTALL_SCRIPT = Path(__file__).resolve().parent.parent / 'scripts/install.py'
 
@@ -23,10 +25,10 @@ class InstallSkillsTest(unittest.TestCase):
         cls.apply_link_migration = staticmethod(installer['apply_link_migration'])
 
     def setUp(self):
+        self.env = isolate_git_environment(self)
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name).resolve()
-        self.env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1')
         self.prepare_source_repository()
         self.set_project_paths(self.root / 'project')
         self.repo.mkdir()
@@ -655,4 +657,5 @@ class RenderExcludeTest(unittest.TestCase):
 
 
 if __name__ == '__main__':
+    from test_copy_install import CopyInstallTest
     unittest.main()

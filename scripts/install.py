@@ -1,7 +1,7 @@
-"""配布用スキルを個別リンクで登録し、一括リンクから移行する。
+"""配布用スキルを個別リンクまたはコピーで登録する。
 
-使い方: python3 scripts/install.py <登録先ディレクトリ> [<skill-name> ...]
-削除:   python3 scripts/install.py <登録先ディレクトリ> --remove <skill-name> ...
+使い方: python3 scripts/install.py <登録先ディレクトリ> [<skill-name> ...] [--mode copy]
+削除:   python3 scripts/install.py <登録先ディレクトリ> [--mode copy] --remove <skill-name> ...
 失敗前に完了した変更は残る。
 """
 
@@ -17,6 +17,7 @@ import sys
 BEGIN = "# BEGIN agent-skills"
 END = "# END agent-skills"
 LINK_NAME = "agent-skills"
+MANAGEMENT = ".agent-skills-copy"
 RESERVED_NAMES = {LINK_NAME, "install-skills"}
 
 
@@ -256,15 +257,30 @@ def configure_git_excludes(repository, plan):
     print(f"Git 除外設定: {exclude}")
 
 
-def install(destination, skill_names=(), remove=False):
+def install(destination, skill_names=(), remove=False, mode="symlink"):
     destination = Path(destination).expanduser().resolve()
     source_root = Path(__file__).resolve().parent.parent / "skills"
-    if not source_root.is_dir():
+    if not source_root.is_dir() and (mode != "copy" or source_root.exists()):
         raise ValueError(f"登録元が見つかりません: {source_root}")
     if destination == source_root or source_root in destination.parents:
         raise ValueError("登録元の skills/ 内には登録できません")
     repository = repository_for(destination)
+    if mode == "copy":
+        from copy_install import install_copy
+        install_copy(source_root, destination, repository, skill_names, remove)
+        return
+    if mode != "symlink":
+        raise ValueError(f"未対応の登録方式: {mode}")
     plan = plan_installation(source_root, destination, repository, skill_names, remove)
+    if plan.conflicts:
+        # コピーの管理情報が残る項目は、古いリンクの除外記録として扱わない。
+        # 管理情報の破損やコピー先の編集があっても、除外を維持して停止する。
+        copies = [target for target in plan.conflicts
+                  if occupied(destination / MANAGEMENT / (target.name + ".json"))]
+        if copies:
+            raise ValueError("コピーの管理情報がある項目はリンク方式で変更できません: "
+                             + ", ".join(str(path) for path in copies)
+                             + "。--mode copy で管理し、リンクへ戻す場合はコピーを明示削除してください")
     if repository:
         # マーカーと除外の有効性をリンク変更前に確認する。
         # 競合する項目の古い除外記録だけは、登録不可の場合も取り除く。
@@ -278,10 +294,11 @@ def install(destination, skill_names=(), remove=False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="配布用スキルを個別リンクで登録する")
+    parser = argparse.ArgumentParser(description="配布用スキルを個別リンクまたはコピーで登録する")
     parser.add_argument("destination", help="登録先ディレクトリ（必須）")
     parser.add_argument("skills", nargs="*", help="登録するスキル名（省略時は全スキル）")
-    parser.add_argument("--remove", nargs="+", metavar="SKILL", help="明示したスキルのリンクだけを削除する")
+    parser.add_argument("--mode", choices=("symlink", "copy"), default="symlink", help="登録方式（既定: symlink）")
+    parser.add_argument("--remove", nargs="+", metavar="SKILL", help="指定方式で登録した、明示したスキルだけを削除する")
     args = parser.parse_args()
     if not args.destination:
         parser.error("登録先ディレクトリを指定してください")
@@ -289,7 +306,7 @@ def main():
         parser.error("登録と削除は同時に指定できません")
     try:
         install(args.destination, args.remove if args.remove is not None else args.skills,
-                remove=args.remove is not None)
+                remove=args.remove is not None, mode=args.mode)
     except (OSError, ValueError) as error:
         print(f"エラー: {error}", file=sys.stderr)
         return 1
