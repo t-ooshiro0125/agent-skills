@@ -482,6 +482,119 @@ c.install_copy(Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4]), ('alpha'
             self.run_install(['alpha'], success=False)
         self.assertEqual((self.tree(), self.exclude.read_bytes()), before)
 
+    def test_interrupted_management_initialization_allows_retry(self):
+        for phase in ('writing-owner', 'owner-ready'):
+            with self.subTest(phase=phase):
+                target = self.target / phase
+                script = '''
+import os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import copy_install as c
+if sys.argv[5] == 'writing-owner':
+    original = c.tempfile.mkstemp
+    def interrupt(*args, **kwargs):
+        original(*args, **kwargs)
+        os._exit(42)
+    c.tempfile.mkstemp = interrupt
+else:
+    original = c.atomic_json
+    def interrupt(path, value):
+        original(path, value)
+        if path.name == c.OWNER_FILE:
+            os._exit(42)
+    c.atomic_json = interrupt
+c.install_copy(Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4]), ('alpha',))
+'''
+                result = subprocess.run(
+                    [sys.executable, '-c', script, str(self.source / 'scripts'),
+                     str(self.source / 'skills'), str(target), str(self.repo), phase],
+                    env=self.env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
+                self.assertFalse((target / copy_install.MANAGEMENT).exists())
+                self.assertFalse((target / 'alpha').exists())
+                self.run_install(['alpha'], target=target)
+                self.assertEqual((target / 'alpha/SKILL.md').read_text(), 'alpha')
+                self.assertEqual(json.loads((target / copy_install.MANAGEMENT /
+                                            copy_install.OWNER_FILE).read_text()), copy_install.OWNER)
+
+    def test_concurrent_management_initialization_preserves_other_installation(self):
+        original = copy_install.publish_directory
+        root = self.target / copy_install.MANAGEMENT
+        published = []
+        def publish_other(path, destination):
+            if path.name.startswith(copy_install.MANAGEMENT + '-init-') and destination == root:
+                self.run_install(['beta'])
+                published.append(root.stat().st_ino)
+            return original(path, destination)
+        with patch.object(copy_install, 'publish_directory', publish_other):
+            self.direct(['alpha'])
+        self.assertEqual(published, [root.stat().st_ino])
+        for name in ('alpha', 'beta'):
+            self.assertEqual((self.target / name / 'SKILL.md').read_text(), name)
+            self.assertTrue(self.manifest(name).is_file())
+        self.assertEqual(list(self.target.glob(copy_install.MANAGEMENT + '-init-*')), [])
+        self.assertEqual(self.git('status', '--porcelain', '--untracked-files=all'), '')
+
+    def test_management_initialization_does_not_replace_an_unrelated_directory(self):
+        original = copy_install.atomic_json
+        root = self.target / copy_install.MANAGEMENT
+        def create_unrelated(path, value):
+            original(path, value)
+            if path.name == copy_install.OWNER_FILE:
+                root.mkdir()
+        with patch.object(copy_install, 'atomic_json', create_unrelated):
+            with self.assertRaisesRegex(ValueError, '管理情報を読み取れません'):
+                self.direct(['alpha'])
+        self.assertEqual(list(root.iterdir()), [])
+        self.assertFalse((self.target / 'alpha').exists())
+        self.assertEqual(list(self.target.glob(copy_install.MANAGEMENT + '-init-*')), [])
+        self.run_install(['alpha'], success=False)
+
+    def test_management_publication_does_not_replace_a_directory_created_at_rename(self):
+        original = copy_install.publish_directory
+        root = self.target / copy_install.MANAGEMENT
+        created = []
+        def create_at_rename(path, destination):
+            if path.name.startswith(copy_install.MANAGEMENT + '-init-') and destination == root:
+                root.mkdir()
+                root.chmod(0o755)
+                created.append(root.stat().st_ino)
+            return original(path, destination)
+        with patch.object(copy_install, 'publish_directory', create_at_rename):
+            with self.assertRaisesRegex(ValueError, '管理情報を読み取れません'):
+                self.direct(['alpha'])
+        self.assertEqual(created, [root.stat().st_ino])
+        self.assertEqual(root.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(list(root.iterdir()), [])
+        self.assertFalse((self.target / 'alpha').exists())
+        self.assertEqual(list(self.target.glob(copy_install.MANAGEMENT + '-init-*')), [])
+
+    def test_failed_management_initialization_cleans_staging_and_allows_retry(self):
+        original = copy_install.atomic_json
+        def fail_owner(path, value):
+            if path.name == copy_install.OWNER_FILE:
+                raise OSError('simulated owner write failure')
+            return original(path, value)
+        with patch.object(copy_install, 'atomic_json', fail_owner):
+            with self.assertRaisesRegex(OSError, 'simulated owner write failure'):
+                self.direct(['alpha'])
+        self.assertFalse((self.target / copy_install.MANAGEMENT).exists())
+        self.assertEqual(list(self.target.glob(copy_install.MANAGEMENT + '-init-*')), [])
+        self.run_install(['alpha'])
+        self.assertEqual((self.target / 'alpha/SKILL.md').read_text(), 'alpha')
+
+    def test_management_publication_without_exclusive_rename_stops_safely(self):
+        with patch.object(copy_install.ctypes, 'CDLL', return_value=object()):
+            with self.assertRaises(OSError) as raised:
+                self.direct(['alpha'])
+        self.assertEqual(raised.exception.errno, errno.ENOTSUP)
+        self.assertFalse((self.target / copy_install.MANAGEMENT).exists())
+        self.assertFalse((self.target / 'alpha').exists())
+        self.assertEqual(list(self.target.glob(copy_install.MANAGEMENT + '-init-*')), [])
+        self.run_install(['alpha'])
+        self.assertEqual((self.target / 'alpha/SKILL.md').read_text(), 'alpha')
+
     def test_other_destinations_skills_and_user_exclude_rules_are_preserved(self):
         original = '# user\r\nprivate.txt\r\n'
         self.exclude.write_bytes(original.encode())

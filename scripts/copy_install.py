@@ -1,6 +1,8 @@
 """Git の作業ツリーからスキルをコピーし、配置履歴に基づいて同期する。"""
 
 from contextlib import contextmanager
+import ctypes
+import errno
 import fcntl
 import hashlib
 import json
@@ -11,6 +13,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 from urllib.parse import unquote
 
@@ -296,16 +299,46 @@ def update_copy_exclude(repository, destination, name, remove):
     print(f"Git 除外設定: {path}")
 
 
+def publish_directory(source, destination):
+    """OS の排他的 rename で公開し、既存の空ディレクトリも置き換えない。"""
+    library = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        operation = getattr(library, "renamex_np", None)
+        argument_types = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        # macOS: RENAME_EXCL（bsd/sys/stdio.h）。
+        arguments = (os.fsencode(source), os.fsencode(destination), 0x00000004)
+    elif sys.platform.startswith("linux"):
+        operation = getattr(library, "renameat2", None)
+        argument_types = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+                          ctypes.c_char_p, ctypes.c_uint]
+        # Linux: AT_FDCWD, RENAME_NOREPLACE（rename(2)）。
+        arguments = (-100, os.fsencode(source), -100, os.fsencode(destination), 1)
+    else:
+        operation = None
+    if operation is None:
+        raise OSError(errno.ENOTSUP, "この環境では管理ディレクトリを安全に公開できません", str(destination))
+    operation.argtypes = argument_types
+    operation.restype = ctypes.c_int
+    if operation(*arguments) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), str(destination))
+
+
 @contextmanager
 def copy_lock(root):
-    created = not root.exists()
-    if created:
-        root.mkdir(parents=True)
-        try:
-            atomic_json(root / OWNER_FILE, OWNER)
-        except BaseException:
-            root.rmdir()
-            raise
+    if not occupied(root):
+        root.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=MANAGEMENT + "-init-", dir=root.parent) as temporary:
+            staging = Path(temporary)
+            atomic_json(staging / OWNER_FILE, OWNER)
+            if not occupied(root):
+                try:
+                    publish_directory(staging, root)
+                except OSError as error:
+                    # 別の初期化が先に公開した、所有情報を持つディレクトリは置き換えない。
+                    if error.errno not in (errno.EEXIST, errno.ENOTEMPTY):
+                        raise
+            management_root(root.parent)
     lock = root / ".lock"
     regular_path(lock, root)
     with lock.open("a+b") as stream:
