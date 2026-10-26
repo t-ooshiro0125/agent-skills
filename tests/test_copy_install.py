@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -258,6 +259,110 @@ c.install_copy(Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4]), ('alpha'
         self.run_install(['alpha', 'beta'])
         self.run_install(['alpha'])
         self.assertFalse((self.target / 'gamma').exists())
+
+    def test_selective_dependency_sync_cannot_break_an_installed_dependent(self):
+        self.put('alpha/SKILL.md', '[guide](../beta/references/old.md)')
+        self.put('beta/references/old.md', 'guide')
+        self.track()
+        self.run_install(['alpha', 'beta'])
+        (self.source / 'skills/beta/references/old.md').rename(
+            self.source / 'skills/beta/references/new.md')
+        self.put('alpha/SKILL.md', '[guide](../beta/references/new.md)')
+        self.track()
+        result = self.assert_preflight_failure(['beta'], message='alpha')
+        self.assertIn('beta/references/old.md', result.stderr)
+        self.run_install(['alpha', 'beta'])
+        self.assertEqual((self.target / 'alpha/SKILL.md').read_text(),
+                         '[guide](../beta/references/new.md)')
+        self.assertEqual((self.target / 'beta/references/new.md').read_text(), 'guide')
+        self.assertFalse((self.target / 'beta/references/old.md').exists())
+
+    def test_dependency_directory_sync_reports_all_installed_dependents(self):
+        for name in ('alpha', 'gamma'):
+            self.put(name + '/SKILL.md', '[guides](../beta/old/)')
+        self.put('beta/old/guide.md', 'guide')
+        self.track()
+        self.run_install()
+        (self.source / 'skills/beta/old').rename(self.source / 'skills/beta/new')
+        for name in ('alpha', 'gamma'):
+            self.put(name + '/SKILL.md', '[guides](../beta/new/)')
+        self.track()
+        result = self.assert_preflight_failure(['beta'], message='beta/old')
+        self.assertIn('alpha', result.stderr)
+        self.assertIn('gamma', result.stderr)
+        self.assert_preflight_failure(['alpha', 'beta'], message='gamma')
+        self.run_install()
+        self.assertTrue((self.target / 'beta/new/guide.md').is_file())
+        self.assertFalse((self.target / 'beta/old').exists())
+
+    def test_compatible_dependency_sync_preserves_unselected_copies(self):
+        self.put('alpha/SKILL.md', '[guide](../beta/references/guide.md)\n[script](scripts/run.py)')
+        self.put('alpha/scripts/run.py', 'print("run")')
+        self.put('beta/references/guide.md', 'old')
+        self.track()
+        self.run_install()
+        (self.target / 'gamma/SKILL.md').write_text('unrelated user edit')
+        unselected = self.tree(self.target / 'alpha'), self.tree(self.target / 'gamma')
+        self.put('beta/references/guide.md', 'new')
+        self.run_install(['beta'])
+        self.assertEqual((self.tree(self.target / 'alpha'), self.tree(self.target / 'gamma')), unselected)
+        self.assertEqual((self.target / 'beta/references/guide.md').read_text(), 'new')
+
+    def test_dependency_sync_protects_a_dependent_removed_from_source(self):
+        self.put('alpha/SKILL.md', '[guide](../beta/references/old.md)')
+        self.put('beta/references/old.md', 'guide')
+        self.track()
+        self.run_install(['alpha', 'beta'])
+        shutil.rmtree(self.source / 'skills/alpha')
+        (self.source / 'skills/beta/references/old.md').unlink()
+        self.track()
+        self.assert_preflight_failure(['beta'], message='alpha')
+
+    def test_fifo_in_unselected_copy_stops_sync_without_blocking_or_changes(self):
+        self.run_install()
+        path = self.target / 'gamma/SKILL.md'
+        path.unlink()
+        os.mkfifo(path)
+        self.put('beta/SKILL.md', 'updated beta')
+        metadata = self.target / copy_install.MANAGEMENT
+        before = self.tree(self.target / 'beta'), self.tree(metadata), self.exclude.read_bytes()
+        result = subprocess.run(
+            [sys.executable, str(self.source / 'scripts/install.py'), str(self.target),
+             'beta', '--mode', 'copy'], env=self.env, capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('通常ファイル以外', result.stderr)
+        self.assertIn(str(path), result.stderr)
+        self.assertTrue(stat.S_ISFIFO(path.stat().st_mode))
+        self.assertEqual((self.tree(self.target / 'beta'), self.tree(metadata),
+                          self.exclude.read_bytes()), before)
+
+    def test_reference_file_replaced_with_fifo_at_open_is_rejected_without_blocking(self):
+        path = self.root / 'reference.md'
+        path.write_text('regular file')
+        script = '''
+import os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import copy_install as c
+path = Path(sys.argv[2])
+original = os.open
+def replace_before_open(file, flags, *args, **kwargs):
+    if Path(file) == path:
+        path.unlink()
+        os.mkfifo(path)
+    return original(file, flags, *args, **kwargs)
+c.os.open = replace_before_open
+try:
+    c.read_regular_bytes(path)
+except ValueError as error:
+    print(error, file=sys.stderr)
+    sys.exit(1)
+'''
+        result = subprocess.run([sys.executable, '-c', script, str(self.source / 'scripts'), str(path)],
+                                env=self.env, capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('通常ファイル以外', result.stderr)
+        self.assertTrue(stat.S_ISFIFO(path.stat().st_mode))
 
     def test_skill_directory_dependency_requires_a_managed_copy(self):
         self.put('alpha/SKILL.md', '[beta](../beta/)')

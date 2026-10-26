@@ -190,6 +190,19 @@ def managed_target(source, destination, name, repository):
     return current, record
 
 
+def reference_exists(files, relative):
+    return relative == "." or relative in files or relative in parent_directories(files)
+
+
+def read_regular_bytes(path):
+    """FIFO へ置き換わっていても、読み込み待ちせず通常ファイルか確認する。"""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise ValueError(f"コピー先に通常ファイル以外の項目があります: {path}")
+        return stream.read()
+
+
 def references(name, files):
     """Markdown に記載された相対パスから兄弟スキルへの参照を得る。"""
     found = set()
@@ -213,10 +226,39 @@ def references(name, files):
             if parts[0] != name:
                 validate_names([parts[0]])
                 found.add((parts[0], within_skill))
-            elif (within_skill != "." and within_skill not in files
-                  and within_skill not in parent_directories(files)):
+            elif not reference_exists(files, within_skill):
                 raise ValueError(f"参照先がコピー対象にありません（git add を確認してください）: {name}/{filename}: {value}")
     return found
+
+
+def validate_installed_dependents(source, destination, contents):
+    """指定外のコピーから、同期後に消える参照先が使われていないか確認する。"""
+    broken = []
+    for manifest in sorted(management_root(destination).glob("*.json")):
+        name = manifest.stem
+        if manifest.name == OWNER_FILE or name in contents:
+            continue
+        record = read_json(manifest)
+        if not isinstance(record, dict) or record.get("source") != str(source):
+            continue
+        validate_names([name])
+        validate_record(record, source, manifest)
+        # 指定外のコピーは更新せず、現在配置されている Markdown の参照を調べる。
+        # 内部参照の照合用に、Markdown 以外もファイル名を保持する。
+        files = {path: (b"", info["mode"]) for path, info in record["files"].items()}
+        for relative in files:
+            if relative.lower().endswith(".md"):
+                path = destination / name / relative
+                regular_path(path, destination)
+                files[relative] = (read_regular_bytes(path), files[relative][1])
+        for dependency, relative in sorted(references(name, files)):
+            if dependency in contents:
+                proposed = contents[dependency]
+                if not reference_exists(proposed, relative):
+                    broken.append(f"{name} → {dependency}/{relative}")
+    if broken:
+        raise ValueError("登録済みスキルの依存参照が切れます。参照元も --mode copy の同期対象に"
+                         "追加してください: " + ", ".join(broken))
 
 
 def validate_dependencies(source, destination, contents, repository, available):
@@ -244,12 +286,12 @@ def validate_dependencies(source, destination, contents, repository, available):
                 else:
                     dependency_files = {p: ((target / p).read_bytes(), value["mode"])
                                         for p, value in record["files"].items()}
-            if (relative != "." and relative not in dependency_files
-                    and relative not in parent_directories(dependency_files)):
+            if not reference_exists(dependency_files, relative):
                 raise ValueError(f"依存参照先がありません: {name} → {dependency}/{relative}")
             queue.append((dependency, dependency_files))
     if missing:
         raise ValueError("依存スキルが未登録です。--mode copy で追加指定してください: " + ", ".join(sorted(missing)))
+    validate_installed_dependents(source, destination, contents)
 
 
 def exclude_path(repository):
