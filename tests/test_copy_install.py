@@ -761,6 +761,106 @@ c.install_copy(Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4]), ('alpha'
         self.assertEqual((self.source / 'skills/alpha/SKILL.md').read_text(), 'alpha')
         self.run_install(['alpha'])
 
+    def test_interrupted_transaction_initialization_preserves_skill_and_allows_retry(self):
+        for operation in ('install', 'sync', 'remove'):
+            for phase in ('writing-owner', 'owner-ready'):
+                with self.subTest(operation=operation, phase=phase):
+                    target = self.target / (operation + '-' + phase)
+                    self.put('alpha/SKILL.md', 'alpha')
+                    if operation != 'install':
+                        self.run_install(['alpha'], target=target)
+                    if operation == 'sync':
+                        self.put('alpha/SKILL.md', 'updated alpha')
+                    manifest = target / copy_install.MANAGEMENT / 'alpha.json'
+                    before = self.tree(target / 'alpha'), manifest.read_bytes() if manifest.exists() else None
+                    script = '''
+import os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import copy_install as c
+if sys.argv[5] == 'writing-owner':
+    original = c.tempfile.mkstemp
+    def interrupt(*args, **kwargs):
+        descriptor, name = original(*args, **kwargs)
+        if Path(name).parent.parent.name == 'transactions':
+            os._exit(42)
+        return descriptor, name
+    c.tempfile.mkstemp = interrupt
+else:
+    original = c.atomic_json
+    def interrupt(path, value):
+        original(path, value)
+        if path.name == 'owner.json' and path.parent.parent.name == 'transactions':
+            os._exit(42)
+    c.atomic_json = interrupt
+c.install_copy(Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4]), ('alpha',), sys.argv[6] == 'remove')
+'''
+                    result = subprocess.run(
+                        [sys.executable, '-c', script, str(self.source / 'scripts'),
+                         str(self.source / 'skills'), str(target), str(self.repo), phase, operation],
+                        env=self.env, capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, 42, result.stdout + result.stderr)
+                    self.assertEqual((self.tree(target / 'alpha'),
+                                      manifest.read_bytes() if manifest.exists() else None), before)
+                    transaction = target / copy_install.MANAGEMENT / 'transactions/alpha'
+                    self.assertFalse(transaction.exists())
+                    self.run_install(['alpha'], target=target, remove=operation == 'remove')
+                    self.assertFalse(transaction.exists())
+                    if operation == 'remove':
+                        self.assertFalse((target / 'alpha').exists())
+                        self.assertFalse(manifest.exists())
+                    else:
+                        expected = 'updated alpha' if operation == 'sync' else 'alpha'
+                        self.assertEqual((target / 'alpha/SKILL.md').read_text(), expected)
+
+    def test_transaction_publication_preserves_existing_recovery_information(self):
+        self.run_install(['alpha'])
+        self.put('alpha/SKILL.md', 'updated alpha')
+        transaction = self.target / copy_install.MANAGEMENT / 'transactions/alpha'
+        original = copy_install.publish_directory
+        before = self.tree(self.target / 'alpha'), self.manifest('alpha').read_bytes(), self.exclude.read_bytes()
+        for kind in ('empty', 'foreign-owner'):
+            with self.subTest(kind=kind):
+                created = []
+                def publish_with_conflict(staging, destination):
+                    if destination == transaction:
+                        transaction.mkdir(mode=0o755)
+                        if kind == 'foreign-owner':
+                            (transaction / 'owner.json').write_text('foreign recovery information')
+                        created.append((transaction.stat().st_ino, self.tree(transaction)))
+                    return original(staging, destination)
+                with patch.object(copy_install, 'publish_directory', publish_with_conflict):
+                    with self.assertRaises(OSError) as raised:
+                        self.direct(['alpha'])
+                self.assertEqual(raised.exception.errno, errno.EEXIST)
+                self.assertEqual(created, [(transaction.stat().st_ino, self.tree(transaction))])
+                self.assertEqual((self.tree(self.target / 'alpha'), self.manifest('alpha').read_bytes(),
+                                  self.exclude.read_bytes()), before)
+                self.assertEqual(list(transaction.parent.glob('.alpha-init-*')), [])
+                shutil.rmtree(transaction)
+        self.run_install(['alpha'])
+        self.assertEqual((self.target / 'alpha/SKILL.md').read_text(), 'updated alpha')
+
+    def test_failed_transaction_initialization_cleans_staging_and_allows_retry(self):
+        self.run_install(['alpha'])
+        self.put('alpha/SKILL.md', 'updated alpha')
+        root = self.target / copy_install.MANAGEMENT
+        before = self.tree(self.target / 'alpha'), self.manifest('alpha').read_bytes()
+        original = copy_install.atomic_json
+        def fail_owner(path, value):
+            if path.name == 'owner.json' and path.parent.parent.name == 'transactions':
+                (path.parent / '.write-incomplete').write_bytes(b'partial owner')
+                raise OSError('simulated transaction owner failure')
+            return original(path, value)
+        with patch.object(copy_install, 'atomic_json', fail_owner):
+            with self.assertRaisesRegex(OSError, 'simulated transaction owner failure'):
+                self.direct(['alpha'])
+        self.assertEqual((self.tree(self.target / 'alpha'), self.manifest('alpha').read_bytes()), before)
+        self.assertFalse((root / 'transactions/alpha').exists())
+        self.assertEqual(list((root / 'transactions').glob('.alpha-init-*')), [])
+        self.run_install(['alpha'])
+        self.assertEqual((self.target / 'alpha/SKILL.md').read_text(), 'updated alpha')
+
     def test_hard_interruption_recovers_copy_and_metadata_on_rerun(self):
         self.run_install()
         self.put('alpha/SKILL.md', 'new alpha')

@@ -482,11 +482,15 @@ def recover_transaction(source, destination, name, repository):
 def apply_copy(source, destination, name, files, before, before_record, repository, remove):
     root = management_root(destination)
     transaction = root / "transactions" / name
-    transaction.mkdir(parents=True)
+    transaction.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=f".{name}-init-", dir=transaction.parent) as temporary:
+        staging = Path(temporary)
+        atomic_json(staging / "owner.json", {**OWNER, "source": str(source), "name": name})
+        # 公開前の失敗では復旧処理を呼ばず、既存の復旧情報を保護する。
+        publish_directory(staging, transaction)
     after_record = None if remove else content_record(source, files)
     target, manifest = destination / name, root / (name + ".json")
     try:
-        atomic_json(transaction / "owner.json", {**OWNER, "source": str(source), "name": name})
         if not remove:
             stage = transaction / "after"
             stage.mkdir()
