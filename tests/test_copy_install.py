@@ -401,6 +401,23 @@ c.install_copy(Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4]), ('alpha'
         self.assertTrue((self.target / 'alpha').is_symlink())
         self.assert_preflight_failure(['alpha'], remove=True, message='copy 方式で管理していない')
 
+    def test_rejected_symlink_operations_preserve_managed_copy_exclusions(self):
+        self.run_install(['alpha', 'beta'])
+        for state in ('unchanged', 'edited', 'corrupt-metadata'):
+            if state == 'edited':
+                (self.target / 'alpha/SKILL.md').write_text('user edit')
+            elif state == 'corrupt-metadata':
+                self.manifest('alpha').write_text('invalid json')
+            before = self.tree(), self.exclude.read_bytes()
+            self.assertEqual(self.git('status', '--porcelain', '--untracked-files=all'), '')
+            for mode in (None, 'symlink'):
+                for names, remove in ((['alpha'], False), ([], False), (['alpha'], True)):
+                    with self.subTest(state=state, mode=mode, names=names, remove=remove):
+                        result = self.run_install(names, mode=mode, remove=remove, success=False)
+                        self.assertIn('コピーの管理情報', result.stderr)
+                        self.assertEqual((self.tree(), self.exclude.read_bytes()), before)
+                        self.assertEqual(self.git('status', '--porcelain', '--untracked-files=all'), '')
+
     def test_own_individual_link_migrates_without_modifying_source(self):
         self.run_install(['alpha'], mode=None)
         source_before = (self.source / 'skills/alpha/SKILL.md').read_bytes()

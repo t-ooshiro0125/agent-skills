@@ -14,11 +14,10 @@ import subprocess
 import tempfile
 from urllib.parse import unquote
 
-from install import (LINK_NAME, RESERVED_NAMES, exclusion_pattern, git, is_tracked,
+from install import (LINK_NAME, MANAGEMENT, RESERVED_NAMES, exclusion_pattern, git, is_tracked,
                      occupied, render_exclude, same_link, update_exclude, validate_names)
 
 
-MANAGEMENT = ".agent-skills-copy"
 OWNER = {"installer": "agent-skills-copy", "version": 1}
 OWNER_FILE = ".owner.json"
 RELATIVE_REFERENCE = re.compile(r"(?<![\w/])(?:\.\.?/)+[^\s`()< >\[\]\"'#]+")

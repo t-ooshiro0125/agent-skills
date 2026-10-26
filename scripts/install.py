@@ -17,6 +17,7 @@ import sys
 BEGIN = "# BEGIN agent-skills"
 END = "# END agent-skills"
 LINK_NAME = "agent-skills"
+MANAGEMENT = ".agent-skills-copy"
 RESERVED_NAMES = {LINK_NAME, "install-skills"}
 
 
@@ -271,6 +272,15 @@ def install(destination, skill_names=(), remove=False, mode="symlink"):
     if mode != "symlink":
         raise ValueError(f"未対応の登録方式: {mode}")
     plan = plan_installation(source_root, destination, repository, skill_names, remove)
+    if plan.conflicts:
+        # コピーの管理情報が残る項目は、古いリンクの除外記録として扱わない。
+        # 管理情報の破損やコピー先の編集があっても、除外を維持して停止する。
+        copies = [target for target in plan.conflicts
+                  if occupied(destination / MANAGEMENT / (target.name + ".json"))]
+        if copies:
+            raise ValueError("コピーの管理情報がある項目はリンク方式で変更できません: "
+                             + ", ".join(str(path) for path in copies)
+                             + "。--mode copy で管理し、リンクへ戻す場合はコピーを明示削除してください")
     if repository:
         # マーカーと除外の有効性をリンク変更前に確認する。
         # 競合する項目の古い除外記録だけは、登録不可の場合も取り除く。
