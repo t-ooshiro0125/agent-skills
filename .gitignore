@@ -1,1 +1,4 @@
 /AGENTS.override.md
+
+__pycache__/
+*.py[co]
