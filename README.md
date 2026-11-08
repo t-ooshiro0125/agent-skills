@@ -21,7 +21,8 @@ Codex では `$<skill-name>`、Claude Code では `/<skill-name>` を依頼に�
 | [write-pr-text](skills/write-pr-text/SKILL.md)                       | コミット済み差分と要件から PR タイトルと本文を作成               | [ガイド](docs/usage/write-pr-text.md)            |
 | [implementation-challenge](skills/implementation-challenge/SKILL.md) | レビュー結果と議論の結論に対する反証                             | [ガイド](docs/usage/implementation-challenge.md) |
 | [review-refactor](skills/review-refactor/SKILL.md)                   | 挙動を維持するリファクタ候補の提示                               | [ガイド](docs/usage/review-refactor.md)          |
-| [review-workflow](skills/review-workflow/SKILL.md)                   | レビュー・反証・リファクタ候補の確認を順に実行                   | [ガイド](docs/usage/review-workflow.md)          |
+| [review-comments](skills/review-comments/SKILL.md)                   | コード内コメントの必要性・簡潔さ・重複・読みやすさ・整合性を確認 | [ガイド](docs/usage/review-comments.md)          |
+| [review-workflow](skills/review-workflow/SKILL.md)                   | レビュー・反証・リファクタ候補・コメントの確認を順に実行         | [ガイド](docs/usage/review-workflow.md)          |
 | [review-handoff](skills/review-handoff/SKILL.md)                     | レビュー後の判断を開発者向け対応指示に変換                       | [ガイド](docs/usage/review-handoff.md)           |
 | [worktree-create](skills/worktree-create/SKILL.md)                   | Git worktree の作成・再利用                                      | [ガイド](docs/usage/worktree-create.md)          |
 | [worktree-link-local](skills/worktree-link-local/SKILL.md)           | 既存 worktree 間のローカルファイル共有                           | [ガイド](docs/usage/worktree-link-local.md)      |

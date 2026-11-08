@@ -1,0 +1,3 @@
+interface:
+  display_name: "Review Comments"
+  short_description: "コード内コメントの必要性・簡潔さ・重複・読みやすさと実装との整合性を確認"
